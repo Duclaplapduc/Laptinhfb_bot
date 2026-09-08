@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+VN_TZ = timezone(timedelta(hours=7))
 from threading import Thread
 from flask import Flask
 
@@ -64,7 +65,7 @@ def init_db():
     con.close()
 
 def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def status_label(status):
     if status == "AVAILABLE":
@@ -145,7 +146,7 @@ def format_duration(start_text, end_text=None):
         end = (
             datetime.strptime(end_text, "%Y-%m-%d %H:%M:%S")
             if end_text
-            else datetime.now()
+            else datetime.now(VN_TZ).replace(tzinfo=None)
         )
         total = max(0, int((end - start).total_seconds()))
         days, rem = divmod(total, 86400)
