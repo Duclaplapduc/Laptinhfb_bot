@@ -151,8 +151,11 @@ def opposite_label(status):
 
 
 def get_live_avatar_url(fb_id):
-    """Trả URL ảnh đại diện công khai khi tín hiệu UID là LIVE; ngược lại None."""
-    url = f"https://graph.facebook.com/{fb_id}/picture?type=normal"
+    """
+    Thử lấy avatar công khai chất lượng lớn.
+    Chỉ trả ảnh khi UID vẫn có tín hiệu LIVE và URL ảnh lớn hợp lệ.
+    Nếu Facebook trả ảnh mặc định/placeholder hoặc lỗi thì không gửi avatar.
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -160,13 +163,42 @@ def get_live_avatar_url(fb_id):
             "Chrome/139.0.0.0 Safari/537.36"
         )
     }
+
     try:
-        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        final_url = r.url
-        if "100x100" in final_url.lower():
-            return final_url
+        # Giữ nguyên tín hiệu LIVE đã dùng từ các phiên bản trước.
+        normal = requests.get(
+            f"https://graph.facebook.com/{fb_id}/picture?type=normal",
+            headers=headers, timeout=15, allow_redirects=True
+        )
+        if "100x100" not in normal.url.lower():
+            return None
+
+        # Sau khi xác định LIVE, thử lấy ảnh lớn.
+        large = requests.get(
+            f"https://graph.facebook.com/{fb_id}/picture?type=large",
+            headers=headers, timeout=15, allow_redirects=True
+        )
+        final_url = large.url.lower()
+
+        # Một số dấu hiệu URL thường gặp của ảnh mặc định/placeholder.
+        default_markers = (
+            "static.xx.fbcdn.net",
+            "silhouette",
+            "default",
+            "unknown",
+            "anon",
+        )
+        if any(marker in final_url for marker in default_markers):
+            print("[AVATAR_SKIP_DEFAULT]", fb_id, large.url, flush=True)
+            return None
+
+        content_type = (large.headers.get("content-type") or "").lower()
+        if large.status_code == 200 and content_type.startswith("image/"):
+            return large.url
+
     except requests.RequestException as e:
         print("[AVATAR_ERROR]", fb_id, type(e).__name__, str(e)[:200], flush=True)
+
     return None
 
 
