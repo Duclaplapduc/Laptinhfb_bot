@@ -240,6 +240,16 @@ def ensure_user(update: Update):
         ))
         con.commit()
 
+    # ADMIN_ID luôn được nâng thành tài khoản quản trị, không hết hạn.
+    if ADMIN_ID and uid == ADMIN_ID:
+        admin_expiry = "2099-12-31 23:59:59"
+        cur.execute("""
+            UPDATE users
+            SET plan='ADMIN', uid_limit=100, is_active=1, expires_at=?
+            WHERE telegram_user_id=?
+        """, (admin_expiry, uid))
+        con.commit()
+
     cur.execute("SELECT * FROM users WHERE telegram_user_id=?", (uid,))
     row = cur.fetchone()
     con.close()
@@ -254,6 +264,8 @@ def subscription_ok(user_row):
 
 
 def remaining_text(user_row):
+    if user_row and user_row["plan"] == "ADMIN":
+        return "Không giới hạn"
     expires = parse_dt(user_row["expires_at"])
     if not expires:
         return "0 ngày"
@@ -342,7 +354,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "LIVE/DIE ở đây không phải trạng thái online/offline riêng tư.\n\n"
         f"🎁 Gói: {row['plan']}\n"
         f"📦 Giới hạn: {row['uid_limit']} UID\n"
-        f"📅 Hết hạn: {row['expires_at']}\n"
+        f"📅 Hết hạn: {'Không giới hạn' if row['plan'] == 'ADMIN' else row['expires_at']}\n"
         f"⏳ Còn lại: {remaining_text(row)}\n\n"
         "Chọn chức năng:"
     )
@@ -366,9 +378,9 @@ async def account_info(update: Update):
         f"🎫 Gói: {row['plan']}\n"
         f"📦 UID: {count}/{row['uid_limit']}\n"
         f"📅 Bắt đầu: {row['created_at']}\n"
-        f"📅 Hết hạn: {row['expires_at']}\n"
+        f"📅 Hết hạn: {'Không giới hạn' if row['plan'] == 'ADMIN' else row['expires_at']}\n"
         f"⏳ Còn lại: {remaining_text(row)}\n"
-        f"🔐 Trạng thái: {'Hoạt động' if subscription_ok(row) else 'Tạm dừng'}",
+        f"🔐 Trạng thái: {'Quản trị viên' if row['plan'] == 'ADMIN' else ('Hoạt động' if subscription_ok(row) else 'Tạm dừng')}",
         reply_markup=keyboard()
     )
 
