@@ -75,123 +75,49 @@ def status_label(status):
 
 def check_facebook(fb_id):
     """
-    Kiểm tra khả năng truy cập công khai của UID Facebook.
-    Không coi trang login/checkpoint/challenge là bằng chứng LIVE.
+    Kiểm tra UID theo tín hiệu public Graph profile picture.
+    Logic tương tự trang Check Live UID đã phân tích:
+    URL cuối chứa 100x100 => LIVE.
+    Request lỗi => UNKNOWN để tránh báo DIE giả.
     """
-    urls = [
-        f"https://www.facebook.com/{fb_id}",
-        f"https://m.facebook.com/{fb_id}",
-    ]
+    url = f"https://graph.facebook.com/{fb_id}/picture?type=normal"
 
     headers = {
-        "User-Agent":
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 "
-            "Mobile/15E148 Safari/604.1",
-        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        )
     }
 
-    unavailable_markers = [
-        "this content isn't available",
-        "this content isn’t available",
-        "page isn't available",
-        "page isn’t available",
-        "content not found",
-        "the link you followed may be broken",
-        "sorry, this content isn't available right now",
-        "trang này hiện không khả dụng",
-        "nội dung này hiện không khả dụng",
-        "liên kết bạn theo dõi có thể bị hỏng",
-        "không tìm thấy trang",
-    ]
+    try:
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        final_url = r.url
 
-    strong_profile_markers = [
-        f'"userid":"{fb_id}"'.lower(),
-        f'"user_id":"{fb_id}"'.lower(),
-        f'"profile_id":"{fb_id}"'.lower(),
-        f'"entity_id":"{fb_id}"'.lower(),
-        f'"actorid":"{fb_id}"'.lower(),
-        f'"profileid":"{fb_id}"'.lower(),
-    ]
+        print(
+            "[FB_CHECK]",
+            f"uid={fb_id}",
+            f"http={r.status_code}",
+            f"final_url={final_url}",
+            flush=True
+        )
 
-    saw_blocked = False
+        if "100x100" in final_url.lower():
+            print("[FB_CHECK_RESULT]", f"uid={fb_id}", "result=AVAILABLE", flush=True)
+            return "AVAILABLE"
 
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-            body = r.text.lower()
-            final_url = r.url.lower()
+        print("[FB_CHECK_RESULT]", f"uid={fb_id}", "result=UNAVAILABLE", flush=True)
+        return "UNAVAILABLE"
 
-            blocked_path = any(
-                x in final_url for x in ["/login", "/checkpoint", "/challenge"]
-            )
-
-            print(
-                "[FB_DIAG]",
-                f"uid={fb_id}",
-                f"request_url={url}",
-                f"http={r.status_code}",
-                f"final_url={r.url}",
-                f"body_len={len(r.text)}",
-                f"blocked_path={blocked_path}",
-                f"strong_profile_marker={any(m in body for m in strong_profile_markers)}",
-                flush=True
-            )
-
-            if r.status_code in (404, 410):
-                return "UNAVAILABLE"
-
-            if any(marker in body for marker in unavailable_markers):
-                return "UNAVAILABLE"
-
-            if blocked_path or r.status_code in (401, 403, 429):
-                saw_blocked = True
-                continue
-
-            if r.status_code == 200 and any(
-                marker in body for marker in strong_profile_markers
-            ):
-                return "AVAILABLE"
-
-            clean_final = final_url.split("?", 1)[0].rstrip("/")
-            direct_urls = {
-                f"https://www.facebook.com/{fb_id}".lower(),
-                f"https://m.facebook.com/{fb_id}".lower(),
-            }
-
-            if r.status_code == 200 and clean_final in direct_urls:
-                return "AVAILABLE"
-
-            if (
-                r.status_code == 200
-                and clean_final in {
-                    "https://www.facebook.com/profile.php",
-                    "https://m.facebook.com/profile.php",
-                }
-                and f"id={fb_id}" in final_url
-            ):
-                return "AVAILABLE"
-
-        except requests.RequestException as e:
-            print(
-                "[FB_DIAG_ERROR]",
-                f"uid={fb_id}",
-                f"request_url={url}",
-                f"error_type={type(e).__name__}",
-                f"error={str(e)[:300]}",
-                flush=True
-            )
-            saw_blocked = True
-
-    print(
-        "[FB_DIAG_RESULT]",
-        f"uid={fb_id}",
-        "result=UNKNOWN",
-        f"saw_blocked={saw_blocked}",
-        flush=True
-    )
-    return "UNKNOWN"
+    except requests.RequestException as e:
+        print(
+            "[FB_CHECK_ERROR]",
+            f"uid={fb_id}",
+            f"error_type={type(e).__name__}",
+            f"error={str(e)[:200]}",
+            flush=True
+        )
+        return "UNKNOWN"
 
 def keyboard():
     return ReplyKeyboardMarkup(
