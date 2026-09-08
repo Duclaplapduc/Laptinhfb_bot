@@ -203,6 +203,7 @@ def format_ticket(row):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["chat_id"] = update.effective_chat.id
     await update.message.reply_text(
         "🤖 LAPTINH FACEBOOK MONITOR\n\n"
         "Theo dõi trạng thái truy cập công khai của Facebook UID.\n"
@@ -279,6 +280,7 @@ async def check_all(update: Update):
     con.close()
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["chat_id"] = update.effective_chat.id
     text = update.message.text.strip()
 
     if text == BTN_ADD:
@@ -304,6 +306,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mode = context.user_data.get("mode")
+
+    # Nếu Render/bot vừa khởi động lại làm mất trạng thái hội thoại,
+    # người dùng vẫn có thể gửi UID dạng số và bot tiếp tục quy trình thêm UID.
+    if mode is None and text.isdigit():
+        context.user_data["new_uid"] = text
+        context.user_data["mode"] = "add_name"
+        await update.message.reply_text(
+            "👤 Nhập tên hiển thị cho UID.\n"
+            "Nếu không cần, gửi dấu -"
+        )
+        return
 
     if mode == "add_uid":
         if not text.isdigit():
@@ -495,8 +508,6 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
     con.commit()
     con.close()
 
-async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data["chat_id"] = update.effective_chat.id
 
 def main():
     if not TOKEN:
@@ -513,14 +524,6 @@ def main():
 
     app.add_handler(
         CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            remember_chat
-        ),
-        group=-1
     )
 
     app.add_handler(
