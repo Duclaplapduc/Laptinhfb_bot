@@ -133,6 +133,20 @@ def check_facebook(fb_id):
             body = r.text.lower()
             final_url = r.url.lower()
 
+            # Chẩn đoán an toàn trên Render Logs:
+            # không in token, cookie hay toàn bộ HTML.
+            print(
+                "[FB_DIAG]",
+                f"uid={fb_id}",
+                f"request_url={url}",
+                f"http={r.status_code}",
+                f"final_url={r.url}",
+                f"body_len={len(r.text)}",
+                f"has_uid_in_body={fb_id.lower() in body}",
+                f"title_present={'<title' in body}",
+                flush=True
+            )
+
             if r.status_code in (404, 410):
                 return "UNAVAILABLE"
 
