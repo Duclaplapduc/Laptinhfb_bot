@@ -49,9 +49,17 @@ def init_db():
             price TEXT,
             status TEXT,
             created_at TEXT,
-            last_check TEXT
+            last_check TEXT,
+            completed_at TEXT
         )
     """)
+
+    # Tự nâng cấp database cũ, không cần xóa facebook.db.
+    cur.execute("PRAGMA table_info(accounts)")
+    columns = {row[1] for row in cur.fetchall()}
+    if "completed_at" not in columns:
+        cur.execute("ALTER TABLE accounts ADD COLUMN completed_at TEXT")
+
     con.commit()
     con.close()
 
@@ -126,25 +134,59 @@ def get_account(fb_id):
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT fb_id,name,note,price,status,created_at,last_check
+        SELECT fb_id,name,note,price,status,created_at,last_check,completed_at
         FROM accounts WHERE fb_id=?
     """, (fb_id,))
     row = cur.fetchone()
     con.close()
     return row
 
+def format_duration(start_text, end_text=None):
+    try:
+        start = datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S")
+        end = (
+            datetime.strptime(end_text, "%Y-%m-%d %H:%M:%S")
+            if end_text
+            else datetime.now()
+        )
+        total = max(0, int((end - start).total_seconds()))
+        days, rem = divmod(total, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+
+        parts = []
+        if days:
+            parts.append(f"{days} ngày")
+        if hours:
+            parts.append(f"{hours} giờ")
+        if minutes:
+            parts.append(f"{minutes} phút")
+        parts.append(f"{seconds} giây")
+        return " ".join(parts)
+    except Exception:
+        return "-"
+
 def format_ticket(row):
-    fb_id, name, note, price, status, created_at, last_check = row
+    fb_id, name, note, price, status, created_at, last_check, completed_at = row
     name = name or "Chưa cập nhật"
     note = note or "-"
     price = price or "0đ"
 
     if status == "AVAILABLE":
         progress = "Đang theo dõi chờ DIE ❌"
+        time_line = f"⏳ Thời gian đã theo dõi: {format_duration(created_at)}"
+        completed_line = ""
     elif status == "UNAVAILABLE":
-        progress = "UID đang DIE ❌"
+        progress = "HOÀN THÀNH ✅"
+        completed_line = f"\n🏁 Hoàn thành: {completed_at or last_check or '-'}"
+        time_line = (
+            f"⏳ Thời gian xử lý: "
+            f"{format_duration(created_at, completed_at or last_check)}"
+        )
     else:
         progress = "Chưa xác định trạng thái 🟡"
+        completed_line = ""
+        time_line = f"⏳ Thời gian đã theo dõi: {format_duration(created_at)}"
 
     return (
         f"{status_label(status)}\n\n"
@@ -155,7 +197,10 @@ def format_ticket(row):
         f"🔄 Tiến trình: {progress}\n"
         f"🕘 Khởi tạo: {created_at}\n"
         f"⏰ Cập nhật: {last_check or 'Chưa kiểm tra'}"
+        f"{completed_line}\n"
+        f"{time_line}"
     )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -170,7 +215,7 @@ async def list_accounts(update: Update):
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT fb_id,name,note,price,status,created_at,last_check
+        SELECT fb_id,name,note,price,status,created_at,last_check,completed_at
         FROM accounts
         ORDER BY created_at DESC
     """)
@@ -308,8 +353,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = con.cursor()
         cur.execute("""
             INSERT OR REPLACE INTO accounts
-            (fb_id,name,note,price,status,created_at,last_check)
-            VALUES(?,?,?,?,?,?,?)
+            (fb_id,name,note,price,status,created_at,last_check,completed_at)
+            VALUES(?,?,?,?,?,?,?,?)
         """, (
             fb_id,
             name,
@@ -317,7 +362,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price,
             status,
             created,
-            created
+            created,
+            created if status == "UNAVAILABLE" else None
         ))
         con.commit()
         con.close()
@@ -415,13 +461,16 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
         if count < 2:
             continue
 
+        completed_at = now if new_status == "UNAVAILABLE" else None
+
         cur.execute("""
             UPDATE accounts
-            SET status=?, last_check=?
+            SET status=?, last_check=?, completed_at=?
             WHERE fb_id=?
         """, (
             new_status,
             now,
+            completed_at,
             fb_id
         ))
 
