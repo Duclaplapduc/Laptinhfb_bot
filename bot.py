@@ -150,11 +150,46 @@ def opposite_label(status):
     return "trạng thái xác định"
 
 
+def _looks_like_default_avatar(response):
+    """
+    Lọc ảnh mặc định/placeholder theo URL, header và kích thước dữ liệu.
+    Đây là heuristic: mục tiêu là thà bỏ ảnh còn hơn gửi avatar trắng/default.
+    """
+    url = (response.url or "").lower()
+    ctype = (response.headers.get("content-type") or "").lower()
+    clen = response.headers.get("content-length")
+
+    default_markers = (
+        "static.xx.fbcdn.net",
+        "silhouette",
+        "default",
+        "unknown",
+        "anon",
+        "blank",
+        "placeholder",
+    )
+
+    if any(marker in url for marker in default_markers):
+        return True
+
+    if not ctype.startswith("image/"):
+        return True
+
+    try:
+        # Avatar thật thường lớn hơn đáng kể; ảnh placeholder rất nhỏ.
+        if clen and int(clen) < 2500:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    return False
+
+
 def get_live_avatar_url(fb_id):
     """
-    Thử lấy avatar công khai chất lượng lớn.
-    Chỉ trả ảnh khi UID vẫn có tín hiệu LIVE và URL ảnh lớn hợp lệ.
-    Nếu Facebook trả ảnh mặc định/placeholder hoặc lỗi thì không gửi avatar.
+    V7: ưu tiên ảnh công khai thật, thử nhiều kích thước.
+    Nếu không đủ tin cậy thì trả None để bot chỉ gửi ticket chữ,
+    tuyệt đối không cố gửi avatar trắng/default.
     """
     headers = {
         "User-Agent": (
@@ -165,40 +200,68 @@ def get_live_avatar_url(fb_id):
     }
 
     try:
-        # Giữ nguyên tín hiệu LIVE đã dùng từ các phiên bản trước.
-        normal = requests.get(
+        # Trước hết xác nhận UID vẫn LIVE theo logic checker đang dùng.
+        probe = requests.get(
             f"https://graph.facebook.com/{fb_id}/picture?type=normal",
-            headers=headers, timeout=15, allow_redirects=True
+            headers=headers,
+            timeout=15,
+            allow_redirects=True
         )
-        if "100x100" not in normal.url.lower():
+        if "100x100" not in (probe.url or "").lower():
             return None
 
-        # Sau khi xác định LIVE, thử lấy ảnh lớn.
-        large = requests.get(
+        candidates = (
+            f"https://graph.facebook.com/{fb_id}/picture?width=800&height=800",
+            f"https://graph.facebook.com/{fb_id}/picture?width=500&height=500",
             f"https://graph.facebook.com/{fb_id}/picture?type=large",
-            headers=headers, timeout=15, allow_redirects=True
+            f"https://graph.facebook.com/{fb_id}/picture?type=normal",
         )
-        final_url = large.url.lower()
 
-        # Một số dấu hiệu URL thường gặp của ảnh mặc định/placeholder.
-        default_markers = (
-            "static.xx.fbcdn.net",
-            "silhouette",
-            "default",
-            "unknown",
-            "anon",
-        )
-        if any(marker in final_url for marker in default_markers):
-            print("[AVATAR_SKIP_DEFAULT]", fb_id, large.url, flush=True)
-            return None
+        for candidate in candidates:
+            try:
+                r = requests.get(
+                    candidate,
+                    headers=headers,
+                    timeout=15,
+                    allow_redirects=True,
+                    stream=True
+                )
 
-        content_type = (large.headers.get("content-type") or "").lower()
-        if large.status_code == 200 and content_type.startswith("image/"):
-            return large.url
+                if r.status_code != 200:
+                    continue
+
+                if _looks_like_default_avatar(r):
+                    print(
+                        "[AVATAR_REJECTED]",
+                        f"uid={fb_id}",
+                        f"url={r.url}",
+                        f"content_length={r.headers.get('content-length')}",
+                        flush=True
+                    )
+                    continue
+
+                # Có ảnh hợp lệ: trả URL cuối để Telegram tự tải.
+                print(
+                    "[AVATAR_OK]",
+                    f"uid={fb_id}",
+                    f"url={r.url}",
+                    flush=True
+                )
+                return r.url
+
+            except requests.RequestException as e:
+                print(
+                    "[AVATAR_CANDIDATE_ERROR]",
+                    f"uid={fb_id}",
+                    type(e).__name__,
+                    str(e)[:160],
+                    flush=True
+                )
 
     except requests.RequestException as e:
         print("[AVATAR_ERROR]", fb_id, type(e).__name__, str(e)[:200], flush=True)
 
+    print("[AVATAR_NONE]", f"uid={fb_id}", flush=True)
     return None
 
 
