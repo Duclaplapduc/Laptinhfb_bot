@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import requests
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
@@ -16,10 +17,19 @@ DB_FILE = "facebook_pro.db"
 CHECK_SECONDS = 30
 TRIAL_DAYS = 15
 TRIAL_UID_LIMIT = 5
+VIP_PRICE = 30000
+VIP_DAYS = 30
+VIP_UID_LIMIT = 50
 VN_TZ = timezone(timedelta(hours=7))
 
 # Trên Render, tạo ADMIN_ID = Telegram numeric user ID của chủ bot.
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+
+# Thông tin nhận chuyển khoản. Cấu hình trên Render Environment.
+# BANK_BIN: mã BIN ngân hàng, ví dụ MB = 970422, Vietcombank = 970436...
+BANK_BIN = os.environ.get("BANK_BIN", "").strip()
+BANK_ACCOUNT = os.environ.get("BANK_ACCOUNT", "").strip()
+BANK_NAME = os.environ.get("BANK_NAME", "").strip()
 
 BTN_ADD = "➕ Thêm UID"
 BTN_LIST = "📋 Danh sách"
@@ -27,6 +37,7 @@ BTN_CHECK = "🔎 Kiểm tra ngay"
 BTN_REMOVE = "❌ Xóa UID"
 BTN_HISTORY = "📜 Lịch sử"
 BTN_ACCOUNT = "👤 Tài khoản"
+BTN_RENEW = "💳 Gia hạn"
 
 web_app = Flask(__name__)
 pending_changes = {}
@@ -188,6 +199,7 @@ def keyboard():
             [BTN_ADD, BTN_LIST],
             [BTN_CHECK, BTN_REMOVE],
             [BTN_HISTORY, BTN_ACCOUNT],
+            [BTN_RENEW],
         ],
         resize_keyboard=True
     )
@@ -385,6 +397,69 @@ async def account_info(update: Update):
     )
 
 
+
+async def renew_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = ensure_user(update)
+    user_id = update.effective_user.id
+
+    if row["plan"] == "ADMIN":
+        await update.message.reply_text(
+            "👑 Bạn là ADMIN nên tài khoản không cần gia hạn.",
+            reply_markup=keyboard()
+        )
+        return
+
+    transfer_content = f"VIP {user_id}"
+
+    if not BANK_BIN or not BANK_ACCOUNT:
+        await update.message.reply_text(
+            "⚠️ Quản trị viên chưa cấu hình tài khoản nhận chuyển khoản.\n\n"
+            f"🆔 Telegram ID của bạn: {user_id}\n"
+            f"📝 Nội dung chuyển khoản: {transfer_content}\n\n"
+            "Vui lòng liên hệ quản trị viên.",
+            reply_markup=keyboard()
+        )
+        return
+
+    qr_url = (
+        f"https://img.vietqr.io/image/{quote(BANK_BIN)}-"
+        f"{quote(BANK_ACCOUNT)}-compact2.png"
+        f"?amount={VIP_PRICE}"
+        f"&addInfo={quote(transfer_content)}"
+        f"&accountName={quote(BANK_NAME)}"
+    )
+
+    caption = (
+        "💎 NÂNG CẤP / GIA HẠN VIP\n\n"
+        f"💰 Giá: {VIP_PRICE:,}đ / {VIP_DAYS} ngày\n".replace(",", ".")
+        + f"📦 Giới hạn: {VIP_UID_LIMIT} UID\n"
+        + f"🏦 Tài khoản nhận: {BANK_ACCOUNT}\n"
+        + f"👤 Chủ tài khoản: {BANK_NAME or 'Chưa cập nhật'}\n"
+        + f"🆔 Telegram ID: {user_id}\n"
+        + f"📝 Nội dung chuyển khoản: {transfer_content}\n\n"
+        "⚠️ Vui lòng giữ nguyên nội dung chuyển khoản để quản trị viên "
+        "xác định đúng tài khoản cần gia hạn.\n\n"
+        "Sau khi chuyển khoản, gửi ảnh giao dịch cho quản trị viên. "
+        "Quản trị viên sẽ gia hạn tài khoản bằng Telegram ID của bạn."
+    )
+
+    try:
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=qr_url,
+            caption=caption
+        )
+    except Exception as e:
+        print("[QR_SEND_ERROR]", type(e).__name__, str(e)[:200], flush=True)
+        await update.message.reply_text(
+            "⚠️ Không tải được ảnh QR lúc này.\n\n"
+            f"🏦 Số tài khoản: {BANK_ACCOUNT}\n"
+            f"👤 Chủ tài khoản: {BANK_NAME or 'Chưa cập nhật'}\n"
+            f"📝 Nội dung chuyển khoản: {transfer_content}",
+            reply_markup=keyboard()
+        )
+
+
 async def list_accounts(update: Update):
     user_id = update.effective_user.id
     con = db()
@@ -495,6 +570,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == BTN_ACCOUNT:
         await account_info(update)
+        return
+
+    if text == BTN_RENEW:
+        await renew_account(update, context)
         return
 
     if text == BTN_LIST:
@@ -791,7 +870,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 Tổng UID: {accounts}\n\n"
         "Lệnh quản trị:\n"
         "/users - danh sách khách\n"
-        "/extend TELEGRAM_ID DAYS - gia hạn\n"
+        "/vip TELEGRAM_ID - VIP 30 ngày / 50 UID\n"
+        "/extend TELEGRAM_ID DAYS - gia hạn tùy số ngày\n"
         "/limit TELEGRAM_ID NUMBER - đổi giới hạn UID\n"
         "/lock TELEGRAM_ID - khóa\n"
         "/unlock TELEGRAM_ID - mở khóa"
@@ -856,13 +936,52 @@ async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cur.execute("""
         UPDATE users
-        SET expires_at=?,is_active=1,plan='PRO'
+        SET expires_at=?,is_active=1,plan='VIP',uid_limit=?
         WHERE telegram_user_id=?
-    """, (new_exp, target))
+    """, (new_exp, VIP_UID_LIMIT, target))
     con.commit()
     con.close()
 
     await update.message.reply_text(f"✅ Đã gia hạn {days} ngày.\nHết hạn mới: {new_exp}")
+
+
+
+async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kích hoạt/gia hạn đúng gói VIP mặc định: 30.000đ / 30 ngày / 50 UID."""
+    if not is_admin(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Dùng: /vip TELEGRAM_ID")
+        return
+
+    target = int(context.args[0])
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM users WHERE telegram_user_id=?", (target,))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        await update.message.reply_text("⚠️ Không tìm thấy khách.")
+        return
+
+    old_exp = parse_dt(row["expires_at"])
+    base = old_exp if old_exp and old_exp > now_dt() else now_dt()
+    new_exp = add_days_text(base, VIP_DAYS)
+
+    cur.execute("""
+        UPDATE users
+        SET expires_at=?,is_active=1,plan='VIP',uid_limit=?
+        WHERE telegram_user_id=?
+    """, (new_exp, VIP_UID_LIMIT, target))
+    con.commit()
+    con.close()
+
+    await update.message.reply_text(
+        f"💎 Đã kích hoạt/gia hạn VIP cho {target}\n"
+        f"📦 Giới hạn: {VIP_UID_LIMIT} UID\n"
+        f"📅 Cộng: {VIP_DAYS} ngày\n"
+        f"⏰ Hết hạn mới: {new_exp}"
+    )
 
 
 async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -932,6 +1051,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("extend", extend_cmd))
+    app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("limit", limit_cmd))
     app.add_handler(CommandHandler("lock", lock_cmd))
     app.add_handler(CommandHandler("unlock", unlock_cmd))
