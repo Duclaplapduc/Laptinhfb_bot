@@ -150,6 +150,46 @@ def opposite_label(status):
     return "trạng thái xác định"
 
 
+def get_live_avatar_url(fb_id):
+    """Trả URL ảnh đại diện công khai khi tín hiệu UID là LIVE; ngược lại None."""
+    url = f"https://graph.facebook.com/{fb_id}/picture?type=normal"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        final_url = r.url
+        if "100x100" in final_url.lower():
+            return final_url
+    except requests.RequestException as e:
+        print("[AVATAR_ERROR]", fb_id, type(e).__name__, str(e)[:200], flush=True)
+    return None
+
+
+async def send_account_ticket(message, row):
+    """LIVE: ưu tiên gửi avatar + ticket. DIE/UNKNOWN: gửi ticket chữ như cũ."""
+    ticket = format_ticket(row)
+
+    if row["status"] == "AVAILABLE":
+        avatar_url = get_live_avatar_url(row["fb_id"])
+        if avatar_url:
+            try:
+                await message.reply_photo(
+                    photo=avatar_url,
+                    caption=ticket,
+                    reply_markup=keyboard()
+                )
+                return
+            except Exception as e:
+                print("[AVATAR_SEND_ERROR]", row["fb_id"], type(e).__name__, flush=True)
+
+    await message.reply_text(ticket, reply_markup=keyboard())
+
+
 def check_facebook(fb_id):
     """
     Dùng cùng tín hiệu public Graph profile-picture đã thử nghiệm:
@@ -480,7 +520,7 @@ async def list_accounts(update: Update):
         return
 
     for row in rows:
-        await update.message.reply_text(format_ticket(row), reply_markup=keyboard())
+        await send_account_ticket(update.message, row)
 
 
 async def show_history(update: Update):
@@ -560,7 +600,7 @@ async def check_all(update: Update):
         con.close()
 
         row = get_account(user_id, fb_id)
-        await update.message.reply_text(format_ticket(row), reply_markup=keyboard())
+        await send_account_ticket(update.message, row)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -690,9 +730,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.close()
 
         context.user_data.clear()
-        await update.message.reply_text(
-            format_ticket(get_account(user_id, fb_id)),
-            reply_markup=keyboard()
+        await send_account_ticket(
+            update.message,
+            get_account(user_id, fb_id)
         )
         return
 
@@ -836,7 +876,21 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            await context.bot.send_message(chat_id=row["chat_id"], text=message)
+            if new_status == "AVAILABLE":
+                avatar_url = get_live_avatar_url(fb_id)
+                if avatar_url:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=row["chat_id"],
+                            photo=avatar_url,
+                            caption=message
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id=row["chat_id"], text=message)
+                else:
+                    await context.bot.send_message(chat_id=row["chat_id"], text=message)
+            else:
+                await context.bot.send_message(chat_id=row["chat_id"], text=message)
         except Exception as e:
             print("[TG_SEND_ERROR]", user_id, fb_id, type(e).__name__, flush=True)
 
