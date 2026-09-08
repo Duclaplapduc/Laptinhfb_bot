@@ -76,9 +76,7 @@ def status_label(status):
 def check_facebook(fb_id):
     """
     Kiểm tra khả năng truy cập công khai của UID Facebook.
-    LIVE chỉ khi phản hồi có dấu hiệu profile thật.
-    DIE khi Facebook trả trang không tồn tại/không khả dụng.
-    UNKNOWN khi bị login/checkpoint/challenge hoặc lỗi mạng.
+    Không coi trang login/checkpoint/challenge là bằng chứng LIVE.
     """
     urls = [
         f"https://www.facebook.com/{fb_id}",
@@ -108,33 +106,27 @@ def check_facebook(fb_id):
         "không tìm thấy trang",
     ]
 
-    # Các dấu hiệu thường xuất hiện trong HTML của một profile Facebook hợp lệ.
-    profile_markers = [
-        f'"userID":"{fb_id}"'.lower(),
+    strong_profile_markers = [
+        f'"userid":"{fb_id}"'.lower(),
         f'"user_id":"{fb_id}"'.lower(),
         f'"profile_id":"{fb_id}"'.lower(),
         f'"entity_id":"{fb_id}"'.lower(),
-        f'profile.php?id={fb_id}'.lower(),
-        f'facebook.com/{fb_id}'.lower(),
-        f'm.facebook.com/{fb_id}'.lower(),
+        f'"actorid":"{fb_id}"'.lower(),
+        f'"profileid":"{fb_id}"'.lower(),
     ]
 
     saw_blocked = False
 
     for url in urls:
         try:
-            r = requests.get(
-                url,
-                headers=headers,
-                timeout=15,
-                allow_redirects=True
-            )
-
+            r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
             body = r.text.lower()
             final_url = r.url.lower()
 
-            # Chẩn đoán an toàn trên Render Logs:
-            # không in token, cookie hay toàn bộ HTML.
+            blocked_path = any(
+                x in final_url for x in ["/login", "/checkpoint", "/challenge"]
+            )
+
             print(
                 "[FB_DIAG]",
                 f"uid={fb_id}",
@@ -142,8 +134,8 @@ def check_facebook(fb_id):
                 f"http={r.status_code}",
                 f"final_url={r.url}",
                 f"body_len={len(r.text)}",
-                f"has_uid_in_body={fb_id.lower() in body}",
-                f"title_present={'<title' in body}",
+                f"blocked_path={blocked_path}",
+                f"strong_profile_marker={any(m in body for m in strong_profile_markers)}",
                 flush=True
             )
 
@@ -153,27 +145,33 @@ def check_facebook(fb_id):
             if any(marker in body for marker in unavailable_markers):
                 return "UNAVAILABLE"
 
-            # Nếu HTML chứa UID/profile marker, có đủ dấu hiệu để coi là LIVE.
-            if r.status_code == 200 and any(
-                marker in body for marker in profile_markers
-            ):
-                return "AVAILABLE"
-
-            # URL cuối vẫn trỏ trực tiếp tới UID và không phải trang chặn.
-            blocked_path = any(
-                x in final_url
-                for x in ["/login", "/checkpoint", "/challenge"]
-            )
-            if (
-                r.status_code == 200
-                and fb_id in final_url
-                and not blocked_path
-            ):
-                return "AVAILABLE"
-
             if blocked_path or r.status_code in (401, 403, 429):
                 saw_blocked = True
                 continue
+
+            if r.status_code == 200 and any(
+                marker in body for marker in strong_profile_markers
+            ):
+                return "AVAILABLE"
+
+            clean_final = final_url.split("?", 1)[0].rstrip("/")
+            direct_urls = {
+                f"https://www.facebook.com/{fb_id}".lower(),
+                f"https://m.facebook.com/{fb_id}".lower(),
+            }
+
+            if r.status_code == 200 and clean_final in direct_urls:
+                return "AVAILABLE"
+
+            if (
+                r.status_code == 200
+                and clean_final in {
+                    "https://www.facebook.com/profile.php",
+                    "https://m.facebook.com/profile.php",
+                }
+                and f"id={fb_id}" in final_url
+            ):
+                return "AVAILABLE"
 
         except requests.RequestException as e:
             print(
@@ -185,7 +183,6 @@ def check_facebook(fb_id):
                 flush=True
             )
             saw_blocked = True
-            continue
 
     print(
         "[FB_DIAG_RESULT]",
