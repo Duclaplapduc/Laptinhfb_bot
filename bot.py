@@ -27,6 +27,9 @@ BTN_LIST = "📋 Danh sách"
 BTN_CHECK = "🔍 Kiểm tra ngay"
 BTN_REMOVE = "🗑 Xóa ID"
 
+# Xác nhận thay đổi 2 lần liên tiếp trước khi gửi cảnh báo
+pending_changes = {}
+
 
 # =========================================================
 # WEB SERVER CHO RENDER
@@ -483,47 +486,93 @@ async def auto_monitor(
     for fb_id, old_status in rows:
 
         new_status = check_facebook(fb_id)
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-        now = datetime.now().strftime(
-            "%d/%m/%Y %H:%M"
+        # UNKNOWN thường là lỗi mạng/chặn tạm thời:
+        # chỉ cập nhật thời gian, không đổi trạng thái và không cảnh báo.
+        if new_status == "UNKNOWN":
+            cur.execute(
+                """
+                UPDATE accounts
+                SET last_check = ?
+                WHERE fb_id = ?
+                """,
+                (now, fb_id)
+            )
+            pending_changes.pop(fb_id, None)
+            continue
+
+        # Không thay đổi: xóa bộ đếm xác nhận và chỉ cập nhật thời gian.
+        if not old_status or new_status == old_status:
+            pending_changes.pop(fb_id, None)
+
+            cur.execute(
+                """
+                UPDATE accounts
+                SET status = ?, last_check = ?
+                WHERE fb_id = ?
+                """,
+                (new_status, now, fb_id)
+            )
+            continue
+
+        # Có thay đổi: phải thấy cùng trạng thái mới 2 lần liên tiếp.
+        pending_status, count = pending_changes.get(
+            fb_id, (None, 0)
         )
 
+        if pending_status == new_status:
+            count += 1
+        else:
+            pending_status = new_status
+            count = 1
+
+        pending_changes[fb_id] = (pending_status, count)
+
+        # Lần đầu chỉ ghi nhận nghi ngờ, chưa đổi trạng thái chính thức.
+        if count < 2:
+            cur.execute(
+                """
+                UPDATE accounts
+                SET last_check = ?
+                WHERE fb_id = ?
+                """,
+                (now, fb_id)
+            )
+            continue
+
+        # Xác nhận lần 2: đổi trạng thái chính thức và gửi cảnh báo.
         cur.execute(
             """
             UPDATE accounts
             SET status = ?, last_check = ?
             WHERE fb_id = ?
             """,
-            (
-                new_status,
-                now,
-                fb_id
-            )
+            (new_status, now, fb_id)
         )
 
-        if (
-            old_status
-            and new_status != old_status
-            and new_status != "UNKNOWN"
-        ):
+        pending_changes.pop(fb_id, None)
 
-            chat_id = (
-                context.application
-                .bot_data
-                .get("chat_id")
-            )
+        chat_id = context.application.bot_data.get("chat_id")
 
-            if chat_id:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "🚨 FACEBOOK THAY ĐỔI TRẠNG THÁI\n\n"
-                        f"🆔 ID: {fb_id}\n\n"
-                        f"Trước: {status_text(old_status)}\n"
-                        f"Hiện tại: {status_text(new_status)}"
-                    )
+        if chat_id:
+            if new_status == "UNAVAILABLE":
+                message = (
+                    "🚨 FACEBOOK KHÔNG CÒN TRUY CẬP ĐƯỢC\n\n"
+                    f"🆔 ID: {fb_id}\n"
+                    "🔴 Link/profile hiện không truy cập được."
                 )
+            else:
+                message = (
+                    "✅ FACEBOOK HOẠT ĐỘNG TRỞ LẠI\n\n"
+                    f"🆔 ID: {fb_id}\n"
+                    "🟢 Link/profile đã truy cập được trở lại."
+                )
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message
+            )
 
     con.commit()
     con.close()
@@ -570,11 +619,11 @@ def main():
         )
     )
 
-    # Kiểm tra Facebook mỗi 15 phút
+    # Kiểm tra Facebook mỗi 30 giây
     app.job_queue.run_repeating(
         auto_monitor,
-        interval=900,
-        first=30
+        interval=30,
+        first=10
     )
 
     print(
