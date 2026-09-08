@@ -2,6 +2,8 @@ import os
 import sqlite3
 import requests
 from datetime import datetime
+from threading import Thread
+from flask import Flask
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -12,6 +14,11 @@ from telegram.ext import (
     filters,
 )
 
+
+# =========================================================
+# CẤU HÌNH
+# =========================================================
+
 TOKEN = os.environ.get("BOT_TOKEN")
 DB_FILE = "facebook.db"
 
@@ -21,7 +28,39 @@ BTN_CHECK = "🔍 Kiểm tra ngay"
 BTN_REMOVE = "🗑 Xóa ID"
 
 
+# =========================================================
+# WEB SERVER CHO RENDER
+# =========================================================
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return "Laptinh Facebook Bot is running"
+
+
+@web_app.route("/health")
+def health():
+    return "OK"
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+
+    web_app.run(
+        host="0.0.0.0",
+        port=port,
+        use_reloader=False
+    )
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
 def init_db():
+
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
 
@@ -37,7 +76,12 @@ def init_db():
     con.close()
 
 
+# =========================================================
+# BÀN PHÍM TELEGRAM
+# =========================================================
+
 def keyboard():
+
     return ReplyKeyboardMarkup(
         [
             [BTN_ADD, BTN_LIST],
@@ -47,18 +91,26 @@ def keyboard():
     )
 
 
+# =========================================================
+# KIỂM TRA FACEBOOK
+# =========================================================
+
 def check_facebook(fb_id):
+
     url = f"https://www.facebook.com/{fb_id}"
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
             "Chrome/126.0 Safari/537.36"
         )
     }
 
     try:
+
         r = requests.get(
             url,
             headers=headers,
@@ -88,10 +140,16 @@ def check_facebook(fb_id):
         return "UNKNOWN"
 
     except requests.RequestException:
+
         return "UNKNOWN"
 
 
+# =========================================================
+# HIỂN THỊ TRẠNG THÁI
+# =========================================================
+
 def status_text(status):
+
     if status == "AVAILABLE":
         return "🟢 Có thể truy cập"
 
@@ -101,7 +159,18 @@ def status_text(status):
     return "🟡 Chưa xác định"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# START BOT
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    context.application.bot_data[
+        "chat_id"
+    ] = update.effective_chat.id
 
     await update.message.reply_text(
         "🤖 LAPTINH FACEBOOK MONITOR\n\n"
@@ -111,23 +180,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# =========================================================
+# DANH SÁCH
+# =========================================================
+
 async def show_list(update: Update):
 
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
 
     cur.execute(
-        "SELECT fb_id, status, last_check FROM accounts"
+        "SELECT fb_id, status, last_check "
+        "FROM accounts"
     )
 
     rows = cur.fetchall()
+
     con.close()
 
     if not rows:
+
         await update.message.reply_text(
             "📭 Chưa có Facebook ID nào.",
             reply_markup=keyboard()
         )
+
         return
 
     msg = "📋 DANH SÁCH THEO DÕI\n\n"
@@ -135,7 +212,7 @@ async def show_list(update: Update):
     for fb_id, status, last_check in rows:
 
         msg += (
-            f"ID: {fb_id}\n"
+            f"🆔 {fb_id}\n"
             f"{status_text(status)}\n"
             f"🕒 {last_check or 'Chưa kiểm tra'}\n\n"
         )
@@ -145,6 +222,10 @@ async def show_list(update: Update):
         reply_markup=keyboard()
     )
 
+
+# =========================================================
+# KIỂM TRA TẤT CẢ
+# =========================================================
 
 async def check_all(update: Update):
 
@@ -162,12 +243,14 @@ async def check_all(update: Update):
     rows = cur.fetchall()
 
     if not rows:
+
         con.close()
 
         await update.message.reply_text(
             "📭 Chưa có ID nào.",
             reply_markup=keyboard()
         )
+
         return
 
     msg = "🔍 KẾT QUẢ KIỂM TRA\n\n"
@@ -186,11 +269,15 @@ async def check_all(update: Update):
             SET status = ?, last_check = ?
             WHERE fb_id = ?
             """,
-            (status, now, fb_id)
+            (
+                status,
+                now,
+                fb_id
+            )
         )
 
         msg += (
-            f"{fb_id}\n"
+            f"🆔 {fb_id}\n"
             f"{status_text(status)}\n\n"
         )
 
@@ -203,6 +290,10 @@ async def check_all(update: Update):
     )
 
 
+# =========================================================
+# XỬ LÝ NÚT BẤM
+# =========================================================
+
 async def message_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -210,15 +301,25 @@ async def message_handler(
 
     text = update.message.text.strip()
 
+    # -------------------------
+    # THÊM ID
+    # -------------------------
+
     if text == BTN_ADD:
 
         context.user_data["mode"] = "add"
 
         await update.message.reply_text(
-            "➕ Gửi Facebook ID cần thêm.\n\n"
-            "Ví dụ:\n1000123456789"
+            "➕ Gửi Facebook ID cần theo dõi.\n\n"
+            "Ví dụ:\n"
+            "1000123456789"
         )
+
         return
+
+    # -------------------------
+    # XÓA ID
+    # -------------------------
 
     if text == BTN_REMOVE:
 
@@ -227,33 +328,51 @@ async def message_handler(
         await update.message.reply_text(
             "🗑 Gửi Facebook ID cần xóa."
         )
+
         return
+
+    # -------------------------
+    # DANH SÁCH
+    # -------------------------
 
     if text == BTN_LIST:
 
         await show_list(update)
+
         return
+
+    # -------------------------
+    # KIỂM TRA
+    # -------------------------
 
     if text == BTN_CHECK:
 
         await check_all(update)
+
         return
 
     mode = context.user_data.get("mode")
 
+    # =====================================================
+    # NHẬN ID MỚI
+    # =====================================================
+
     if mode == "add":
 
-        fb_id = text
+        fb_id = text.strip()
 
         if not fb_id.isdigit():
 
             await update.message.reply_text(
-                "⚠️ ID phải là dãy số."
+                "⚠️ Facebook ID phải là dãy số.\n\n"
+                "Ví dụ:\n"
+                "1000123456789"
             )
+
             return
 
         await update.message.reply_text(
-            "⏳ Đang kiểm tra ID..."
+            "⏳ Đang kiểm tra Facebook ID..."
         )
 
         status = check_facebook(fb_id)
@@ -268,10 +387,18 @@ async def message_handler(
         cur.execute(
             """
             INSERT OR REPLACE INTO accounts
-            (fb_id, status, last_check)
+            (
+                fb_id,
+                status,
+                last_check
+            )
             VALUES (?, ?, ?)
             """,
-            (fb_id, status, now)
+            (
+                fb_id,
+                status,
+                now
+            )
         )
 
         con.commit()
@@ -280,42 +407,64 @@ async def message_handler(
         context.user_data["mode"] = None
 
         await update.message.reply_text(
-            f"✅ Đã thêm ID:\n{fb_id}\n\n"
+            "✅ ĐÃ THÊM FACEBOOK ID\n\n"
+            f"🆔 {fb_id}\n"
             f"{status_text(status)}",
             reply_markup=keyboard()
         )
 
         return
 
+    # =====================================================
+    # XÓA ID
+    # =====================================================
+
     if mode == "remove":
 
-        fb_id = text
+        fb_id = text.strip()
 
         con = sqlite3.connect(DB_FILE)
         cur = con.cursor()
 
         cur.execute(
-            "DELETE FROM accounts WHERE fb_id = ?",
+            "DELETE FROM accounts "
+            "WHERE fb_id = ?",
             (fb_id,)
         )
+
+        deleted = cur.rowcount
 
         con.commit()
         con.close()
 
         context.user_data["mode"] = None
 
-        await update.message.reply_text(
-            f"🗑 Đã xóa ID:\n{fb_id}",
-            reply_markup=keyboard()
-        )
+        if deleted:
+
+            await update.message.reply_text(
+                "🗑 ĐÃ XÓA\n\n"
+                f"ID: {fb_id}",
+                reply_markup=keyboard()
+            )
+
+        else:
+
+            await update.message.reply_text(
+                "⚠️ Không tìm thấy ID này.",
+                reply_markup=keyboard()
+            )
 
         return
 
     await update.message.reply_text(
-        "Chọn một chức năng bên dưới.",
+        "👇 Hãy chọn chức năng bên dưới.",
         reply_markup=keyboard()
     )
 
+
+# =========================================================
+# TỰ ĐỘNG KIỂM TRA
+# =========================================================
 
 async def auto_monitor(
     context: ContextTypes.DEFAULT_TYPE
@@ -325,7 +474,8 @@ async def auto_monitor(
     cur = con.cursor()
 
     cur.execute(
-        "SELECT fb_id, status FROM accounts"
+        "SELECT fb_id, status "
+        "FROM accounts"
     )
 
     rows = cur.fetchall()
@@ -344,7 +494,11 @@ async def auto_monitor(
             SET status = ?, last_check = ?
             WHERE fb_id = ?
             """,
-            (new_status, now, fb_id)
+            (
+                new_status,
+                now,
+                fb_id
+            )
         )
 
         if (
@@ -353,8 +507,10 @@ async def auto_monitor(
             and new_status != "UNKNOWN"
         ):
 
-            chat_id = context.application.bot_data.get(
-                "chat_id"
+            chat_id = (
+                context.application
+                .bot_data
+                .get("chat_id")
             )
 
             if chat_id:
@@ -363,10 +519,9 @@ async def auto_monitor(
                     chat_id=chat_id,
                     text=(
                         "🚨 FACEBOOK THAY ĐỔI TRẠNG THÁI\n\n"
-                        f"ID: {fb_id}\n\n"
-                        f"{status_text(old_status)}\n"
-                        "⬇️\n"
-                        f"{status_text(new_status)}"
+                        f"🆔 ID: {fb_id}\n\n"
+                        f"Trước: {status_text(old_status)}\n"
+                        f"Hiện tại: {status_text(new_status)}"
                     )
                 )
 
@@ -374,27 +529,27 @@ async def auto_monitor(
     con.close()
 
 
-async def remember_chat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.application.bot_data[
-        "chat_id"
-    ] = update.effective_chat.id
-
-    await start(update, context)
-
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
     if not TOKEN:
+
         raise RuntimeError(
-            "Chưa thiết lập BOT_TOKEN"
+            "Chưa thiết lập BOT_TOKEN trên Render."
         )
 
     init_db()
 
+    # Chạy web server cho Render
+    Thread(
+        target=run_web,
+        daemon=True
+    ).start()
+
+    # Khởi tạo Telegram Bot
     app = (
         Application.builder()
         .token(TOKEN)
@@ -402,7 +557,10 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", remember_chat)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     app.add_handler(
@@ -412,15 +570,20 @@ def main():
         )
     )
 
+    # Kiểm tra Facebook mỗi 15 phút
     app.job_queue.run_repeating(
         auto_monitor,
         interval=900,
         first=30
     )
 
-    print("Bot đang hoạt động...")
+    print(
+        "Laptinh Facebook Monitor đang hoạt động..."
+    )
 
-    app.run_polling()
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
