@@ -189,19 +189,52 @@ def _looks_like_default_avatar(response):
 def _decode_fb_url(text):
     if not text:
         return None
-    return html.unescape(
-        text.replace("\\u0025", "%")
+
+    value = html.unescape(str(text))
+
+    # Facebook JSON/HTML thường escape URL theo nhiều lớp.
+    for _ in range(3):
+        old = value
+        value = (
+            value
+            .replace("\\u0025", "%")
             .replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u003d", "=")
+            .replace("\\u002F", "/")
+            .replace("\\u002f", "/")
             .replace("\\/", "/")
-    )
+            .replace("\\\\/", "/")
+            .replace("\\\\u0026", "&")
+            .replace("\\\\u003d", "=")
+        )
+        if value == old:
+            break
+
+    return value
+
+
+def _avatar_score(url):
+    """Ưu tiên URL có dấu hiệu là ảnh profile Facebook."""
+    low = (url or "").lower()
+    score = 0
+    if "fbcdn.net" in low:
+        score += 10
+    if "t39.30808-1" in low:
+        score += 30
+    if "profile" in low:
+        score += 20
+    if "scontent" in low:
+        score += 5
+    if "p120x120" in low or "s120x120" in low:
+        score += 5
+    return score
 
 
 def _extract_profile_picture_from_public_page(fb_id):
     """
-    V8: thử lấy avatar thật từ dữ liệu công khai của trang Facebook,
-    không dùng cookie đăng nhập, token hay session riêng tư.
-
-    Ưu tiên URL profile_picture trỏ về fbcdn.net.
+    V9: tìm profile_picture.uri trong dữ liệu HTML/JSON công khai.
+    Không dùng cookie, access token hay phiên đăng nhập.
     """
     headers = {
         "User-Agent": (
@@ -209,20 +242,14 @@ def _extract_profile_picture_from_public_page(fb_id):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/139.0.0.0 Safari/537.36"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
     }
 
     public_urls = (
         f"https://www.facebook.com/{fb_id}",
         f"https://m.facebook.com/{fb_id}",
-    )
-
-    patterns = (
-        # Dạng JSON thường gặp trong dữ liệu Facebook public.
-        r'"profile_picture"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"',
-        r'"profile_picture".{0,300}?"uri"\s*:\s*"([^"]+)"',
-        # Fallback: ảnh profile t39.30808-1 trên CDN.
-        r'(https?:\\?/\\?/scontent[^"\\ ]+?/v/t39\.30808-1/[^"\\ ]+)',
     )
 
     for page_url in public_urls:
@@ -233,36 +260,80 @@ def _extract_profile_picture_from_public_page(fb_id):
                 timeout=20,
                 allow_redirects=True
             )
-
             body = r.text or ""
             final_url = (r.url or "").lower()
 
-            # Nếu Render bị đẩy thẳng sang login/challenge thì bỏ qua nguồn này.
-            if any(x in final_url for x in ("/login", "/checkpoint", "/challenge")):
+            print(
+                "[PUBLIC_PROFILE]",
+                f"uid={fb_id}",
+                f"http={r.status_code}",
+                f"final_url={r.url}",
+                f"body_len={len(body)}",
+                flush=True
+            )
+
+            if any(x in final_url for x in ("/checkpoint", "/challenge")):
                 print("[PUBLIC_PROFILE_BLOCKED]", fb_id, r.url, flush=True)
                 continue
 
-            for pattern in patterns:
-                for match in re.findall(pattern, body, flags=re.I | re.S):
-                    candidate = _decode_fb_url(match)
-                    if not candidate:
-                        continue
+            candidates = []
 
-                    if "fbcdn.net" not in candidate.lower():
-                        continue
+            # 1. Bám trực tiếp vào profile_picture rồi tìm uri gần đó.
+            for m in re.finditer(r'profile_picture', body, flags=re.I):
+                chunk = body[m.start():m.start() + 2500]
 
-                    # Ưu tiên ảnh profile, không lấy ảnh bài đăng thông thường.
-                    low = candidate.lower()
-                    if "t39.30808-1" not in low and "profile" not in low:
-                        continue
+                uri_patterns = (
+                    r'["\\]uri["\\]\s*:\s*["\\]([^"\\]{20,})',
+                    r'"uri"\s*:\s*"([^"]{20,})"',
+                    r'\\"uri\\"\s*:\s*\\"([^"]{20,})',
+                )
 
+                for pat in uri_patterns:
+                    for raw in re.findall(pat, chunk, flags=re.I | re.S):
+                        candidate = _decode_fb_url(raw)
+                        if candidate and "fbcdn.net" in candidate.lower():
+                            candidates.append(candidate)
+
+            # 2. Fallback: tìm trực tiếp URL CDN loại ảnh profile.
+            cdn_patterns = (
+                r'https?:\\?/\\?/[^"\'<>\s]*fbcdn\.net[^"\'<>\s]*t39\.30808-1[^"\'<>\s]+',
+                r'https?://[^"\'<>\s]*fbcdn\.net[^"\'<>\s]*t39\.30808-1[^"\'<>\s]+',
+            )
+
+            for pat in cdn_patterns:
+                for raw in re.findall(pat, body, flags=re.I):
+                    candidate = _decode_fb_url(raw)
+                    if candidate:
+                        candidates.append(candidate)
+
+            # Loại trùng và ưu tiên ứng viên giống ảnh profile nhất.
+            unique = []
+            seen = set()
+            for candidate in candidates:
+                candidate = candidate.rstrip("\\")
+                if candidate not in seen:
+                    seen.add(candidate)
+                    unique.append(candidate)
+
+            unique.sort(key=_avatar_score, reverse=True)
+
+            print(
+                "[PUBLIC_AVATAR_FOUND]",
+                f"uid={fb_id}",
+                f"count={len(unique)}",
+                flush=True
+            )
+
+            for candidate in unique[:10]:
+                validated = _validate_avatar_url(candidate)
+                if validated:
                     print(
-                        "[PUBLIC_AVATAR_CANDIDATE]",
+                        "[AVATAR_OK_PUBLIC]",
                         f"uid={fb_id}",
-                        f"url={candidate[:300]}",
+                        f"url={validated}",
                         flush=True
                     )
-                    return candidate
+                    return validated
 
         except requests.RequestException as e:
             print(
@@ -344,10 +415,8 @@ def get_live_avatar_url(fb_id):
 
     # Nguồn 1: dữ liệu public profile thật.
     public_avatar = _extract_profile_picture_from_public_page(fb_id)
-    validated = _validate_avatar_url(public_avatar)
-    if validated:
-        print("[AVATAR_OK_PUBLIC]", f"uid={fb_id}", f"url={validated}", flush=True)
-        return validated
+    if public_avatar:
+        return public_avatar
 
     # Nguồn 2: Graph fallback.
     candidates = (
