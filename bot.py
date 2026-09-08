@@ -74,52 +74,99 @@ def status_label(status):
     return "🟡 CHƯA XÁC ĐỊNH"
 
 def check_facebook(fb_id):
-    url = f"https://www.facebook.com/{fb_id}"
+    """
+    Kiểm tra khả năng truy cập công khai của UID Facebook.
+    LIVE chỉ khi phản hồi có dấu hiệu profile thật.
+    DIE khi Facebook trả trang không tồn tại/không khả dụng.
+    UNKNOWN khi bị login/checkpoint/challenge hoặc lỗi mạng.
+    """
+    urls = [
+        f"https://www.facebook.com/{fb_id}",
+        f"https://m.facebook.com/{fb_id}",
+    ]
+
     headers = {
         "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 "
+            "Mobile/15E148 Safari/604.1",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
     }
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers,
-            timeout=15,
-            allow_redirects=True
-        )
+    unavailable_markers = [
+        "this content isn't available",
+        "this content isn’t available",
+        "page isn't available",
+        "page isn’t available",
+        "content not found",
+        "the link you followed may be broken",
+        "sorry, this content isn't available right now",
+        "trang này hiện không khả dụng",
+        "nội dung này hiện không khả dụng",
+        "liên kết bạn theo dõi có thể bị hỏng",
+        "không tìm thấy trang",
+    ]
 
-        text = r.text.lower()
-        final_url = r.url.lower()
+    # Các dấu hiệu thường xuất hiện trong HTML của một profile Facebook hợp lệ.
+    profile_markers = [
+        f'"userID":"{fb_id}"'.lower(),
+        f'"user_id":"{fb_id}"'.lower(),
+        f'"profile_id":"{fb_id}"'.lower(),
+        f'"entity_id":"{fb_id}"'.lower(),
+        f'profile.php?id={fb_id}'.lower(),
+        f'facebook.com/{fb_id}'.lower(),
+        f'm.facebook.com/{fb_id}'.lower(),
+    ]
 
-        unavailable_markers = [
-            "this content isn't available",
-            "this content isn’t available",
-            "page isn't available",
-            "page isn’t available",
-            "content not found",
-            "the link you followed may be broken",
-            "trang này hiện không khả dụng",
-            "nội dung này hiện không khả dụng",
-        ]
+    saw_blocked = False
 
-        if r.status_code == 404:
-            return "UNAVAILABLE"
+    for url in urls:
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                timeout=15,
+                allow_redirects=True
+            )
 
-        if any(x in text for x in unavailable_markers):
-            return "UNAVAILABLE"
+            body = r.text.lower()
+            final_url = r.url.lower()
 
-        # Facebook có thể chuyển hướng sang login/checkpoint/challenge.
-        if any(x in final_url for x in ["/login", "/checkpoint", "/challenge"]):
-            return "UNKNOWN"
+            if r.status_code in (404, 410):
+                return "UNAVAILABLE"
 
-        if r.status_code == 200:
-            return "AVAILABLE"
+            if any(marker in body for marker in unavailable_markers):
+                return "UNAVAILABLE"
 
-        return "UNKNOWN"
+            # Nếu HTML chứa UID/profile marker, có đủ dấu hiệu để coi là LIVE.
+            if r.status_code == 200 and any(
+                marker in body for marker in profile_markers
+            ):
+                return "AVAILABLE"
 
-    except requests.RequestException:
-        return "UNKNOWN"
+            # URL cuối vẫn trỏ trực tiếp tới UID và không phải trang chặn.
+            blocked_path = any(
+                x in final_url
+                for x in ["/login", "/checkpoint", "/challenge"]
+            )
+            if (
+                r.status_code == 200
+                and fb_id in final_url
+                and not blocked_path
+            ):
+                return "AVAILABLE"
+
+            if blocked_path or r.status_code in (401, 403, 429):
+                saw_blocked = True
+                continue
+
+        except requests.RequestException:
+            saw_blocked = True
+            continue
+
+    # Không ép LIVE/DIE khi Facebook không cho xác minh chắc chắn.
+    return "UNKNOWN" if saw_blocked else "UNKNOWN"
 
 def keyboard():
     return ReplyKeyboardMarkup(
