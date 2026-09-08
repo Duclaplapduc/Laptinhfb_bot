@@ -7,113 +7,73 @@ from flask import Flask
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
-
-
-# =========================================================
-# CẤU HÌNH
-# =========================================================
 
 TOKEN = os.environ.get("BOT_TOKEN")
 DB_FILE = "facebook.db"
+CHECK_SECONDS = 30
 
-BTN_ADD = "➕ Thêm ID"
+BTN_ADD = "➕ Thêm UID"
 BTN_LIST = "📋 Danh sách"
-BTN_CHECK = "🔍 Kiểm tra ngay"
-BTN_REMOVE = "🗑 Xóa ID"
-
-# Xác nhận thay đổi 2 lần liên tiếp trước khi gửi cảnh báo
-pending_changes = {}
-
-
-# =========================================================
-# WEB SERVER CHO RENDER
-# =========================================================
+BTN_CHECK = "🔎 Kiểm tra ngay"
+BTN_REMOVE = "❌ Xóa UID"
 
 web_app = Flask(__name__)
-
+pending_changes = {}
 
 @web_app.route("/")
 def home():
-    return "Laptinh Facebook Bot is running"
-
+    return "Laptinh Facebook Monitor is running"
 
 @web_app.route("/health")
 def health():
     return "OK"
 
-
 def run_web():
     port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-    web_app.run(
-        host="0.0.0.0",
-        port=port,
-        use_reloader=False
-    )
-
-
-# =========================================================
-# DATABASE
-# =========================================================
+def db():
+    return sqlite3.connect(DB_FILE)
 
 def init_db():
-
-    con = sqlite3.connect(DB_FILE)
+    con = db()
     cur = con.cursor()
-
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
+        CREATE TABLE IF NOT EXISTS accounts(
             fb_id TEXT PRIMARY KEY,
+            name TEXT,
+            note TEXT,
+            price TEXT,
             status TEXT,
+            created_at TEXT,
             last_check TEXT
         )
     """)
-
     con.commit()
     con.close()
 
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# =========================================================
-# BÀN PHÍM TELEGRAM
-# =========================================================
-
-def keyboard():
-
-    return ReplyKeyboardMarkup(
-        [
-            [BTN_ADD, BTN_LIST],
-            [BTN_CHECK, BTN_REMOVE],
-        ],
-        resize_keyboard=True
-    )
-
-
-# =========================================================
-# KIỂM TRA FACEBOOK
-# =========================================================
+def status_label(status):
+    if status == "AVAILABLE":
+        return "✅ LIVE"
+    if status == "UNAVAILABLE":
+        return "❌ DIE"
+    return "🟡 CHƯA XÁC ĐỊNH"
 
 def check_facebook(fb_id):
-
     url = f"https://www.facebook.com/{fb_id}"
-
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/126.0 Safari/537.36"
-        )
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     }
 
     try:
-
         r = requests.get(
             url,
             headers=headers,
@@ -122,20 +82,28 @@ def check_facebook(fb_id):
         )
 
         text = r.text.lower()
+        final_url = r.url.lower()
 
-        unavailable = [
+        unavailable_markers = [
             "this content isn't available",
             "this content isn’t available",
             "page isn't available",
             "page isn’t available",
             "content not found",
+            "the link you followed may be broken",
+            "trang này hiện không khả dụng",
+            "nội dung này hiện không khả dụng",
         ]
 
         if r.status_code == 404:
             return "UNAVAILABLE"
 
-        if any(x in text for x in unavailable):
+        if any(x in text for x in unavailable_markers):
             return "UNAVAILABLE"
+
+        # Facebook có thể chuyển hướng sang login/checkpoint/challenge.
+        if any(x in final_url for x in ["/login", "/checkpoint", "/challenge"]):
+            return "UNKNOWN"
 
         if r.status_code == 200:
             return "AVAILABLE"
@@ -143,382 +111,294 @@ def check_facebook(fb_id):
         return "UNKNOWN"
 
     except requests.RequestException:
-
         return "UNKNOWN"
 
+def keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [BTN_ADD, BTN_LIST],
+            [BTN_CHECK, BTN_REMOVE]
+        ],
+        resize_keyboard=True
+    )
 
-# =========================================================
-# HIỂN THỊ TRẠNG THÁI
-# =========================================================
+def get_account(fb_id):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT fb_id,name,note,price,status,created_at,last_check
+        FROM accounts WHERE fb_id=?
+    """, (fb_id,))
+    row = cur.fetchone()
+    con.close()
+    return row
 
-def status_text(status):
+def format_ticket(row):
+    fb_id, name, note, price, status, created_at, last_check = row
+    name = name or "Chưa cập nhật"
+    note = note or "-"
+    price = price or "0đ"
 
     if status == "AVAILABLE":
-        return "🟢 Có thể truy cập"
+        progress = "Đang theo dõi chờ DIE ❌"
+    elif status == "UNAVAILABLE":
+        progress = "UID đang DIE ❌"
+    else:
+        progress = "Chưa xác định trạng thái 🟡"
 
-    if status == "UNAVAILABLE":
-        return "🔴 Không khả dụng"
+    return (
+        f"{status_label(status)}\n\n"
+        f"🆔 UID: {fb_id}\n"
+        f"👤 Tên: {name}\n"
+        f"📝 Ghi chú: {note}\n"
+        f"💵 Giá: {price}\n"
+        f"🔄 Tiến trình: {progress}\n"
+        f"🕘 Khởi tạo: {created_at}\n"
+        f"⏰ Cập nhật: {last_check or 'Chưa kiểm tra'}"
+    )
 
-    return "🟡 Chưa xác định"
-
-
-# =========================================================
-# START BOT
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    context.application.bot_data[
-        "chat_id"
-    ] = update.effective_chat.id
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 LAPTINH FACEBOOK MONITOR\n\n"
-        "Theo dõi trạng thái công khai của Facebook ID.\n\n"
-        "Chọn chức năng bên dưới:",
+        "Theo dõi trạng thái truy cập công khai của Facebook UID.\n"
+        "Trạng thái dùng: LIVE / DIE / CHƯA XÁC ĐỊNH.\n\n"
+        "Chọn chức năng:",
         reply_markup=keyboard()
     )
 
-
-# =========================================================
-# DANH SÁCH
-# =========================================================
-
-async def show_list(update: Update):
-
-    con = sqlite3.connect(DB_FILE)
+async def list_accounts(update: Update):
+    con = db()
     cur = con.cursor()
-
-    cur.execute(
-        "SELECT fb_id, status, last_check "
-        "FROM accounts"
-    )
-
+    cur.execute("""
+        SELECT fb_id,name,note,price,status,created_at,last_check
+        FROM accounts
+        ORDER BY created_at DESC
+    """)
     rows = cur.fetchall()
-
     con.close()
 
     if not rows:
-
         await update.message.reply_text(
-            "📭 Chưa có Facebook ID nào.",
+            "📭 Chưa có UID nào đang theo dõi.",
             reply_markup=keyboard()
         )
-
         return
 
-    msg = "📋 DANH SÁCH THEO DÕI\n\n"
-
-    for fb_id, status, last_check in rows:
-
-        msg += (
-            f"🆔 {fb_id}\n"
-            f"{status_text(status)}\n"
-            f"🕒 {last_check or 'Chưa kiểm tra'}\n\n"
+    for row in rows:
+        await update.message.reply_text(
+            format_ticket(row),
+            reply_markup=keyboard()
         )
-
-    await update.message.reply_text(
-        msg,
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# KIỂM TRA TẤT CẢ
-# =========================================================
 
 async def check_all(update: Update):
-
-    await update.message.reply_text(
-        "⏳ Đang kiểm tra..."
-    )
-
-    con = sqlite3.connect(DB_FILE)
+    con = db()
     cur = con.cursor()
-
-    cur.execute(
-        "SELECT fb_id FROM accounts"
-    )
-
+    cur.execute("SELECT fb_id FROM accounts ORDER BY created_at DESC")
     rows = cur.fetchall()
 
     if not rows:
-
         con.close()
+        await update.message.reply_text(
+            "📭 Chưa có UID nào.",
+            reply_markup=keyboard()
+        )
+        return
+
+    await update.message.reply_text("⏳ Đang kiểm tra...")
+
+    for (fb_id,) in rows:
+        status = check_facebook(fb_id)
+        now = now_text()
+
+        if status != "UNKNOWN":
+            cur.execute("""
+                UPDATE accounts
+                SET status=?, last_check=?
+                WHERE fb_id=?
+            """, (status, now, fb_id))
+        else:
+            cur.execute("""
+                UPDATE accounts
+                SET last_check=?
+                WHERE fb_id=?
+            """, (now, fb_id))
+
+        con.commit()
+        row = get_account(fb_id)
 
         await update.message.reply_text(
-            "📭 Chưa có ID nào.",
+            format_ticket(row),
             reply_markup=keyboard()
         )
 
-        return
-
-    msg = "🔍 KẾT QUẢ KIỂM TRA\n\n"
-
-    for (fb_id,) in rows:
-
-        status = check_facebook(fb_id)
-
-        now = datetime.now().strftime(
-            "%d/%m/%Y %H:%M"
-        )
-
-        cur.execute(
-            """
-            UPDATE accounts
-            SET status = ?, last_check = ?
-            WHERE fb_id = ?
-            """,
-            (
-                status,
-                now,
-                fb_id
-            )
-        )
-
-        msg += (
-            f"🆔 {fb_id}\n"
-            f"{status_text(status)}\n\n"
-        )
-
-    con.commit()
     con.close()
 
-    await update.message.reply_text(
-        msg,
-        reply_markup=keyboard()
-    )
-
-
-# =========================================================
-# XỬ LÝ NÚT BẤM
-# =========================================================
-
-async def message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # -------------------------
-    # THÊM ID
-    # -------------------------
-
     if text == BTN_ADD:
-
-        context.user_data["mode"] = "add"
-
+        context.user_data["mode"] = "add_uid"
         await update.message.reply_text(
-            "➕ Gửi Facebook ID cần theo dõi.\n\n"
-            "Ví dụ:\n"
-            "1000123456789"
+            "➕ Gửi UID Facebook dạng số."
         )
-
         return
-
-    # -------------------------
-    # XÓA ID
-    # -------------------------
-
-    if text == BTN_REMOVE:
-
-        context.user_data["mode"] = "remove"
-
-        await update.message.reply_text(
-            "🗑 Gửi Facebook ID cần xóa."
-        )
-
-        return
-
-    # -------------------------
-    # DANH SÁCH
-    # -------------------------
 
     if text == BTN_LIST:
-
-        await show_list(update)
-
+        await list_accounts(update)
         return
 
-    # -------------------------
-    # KIỂM TRA
-    # -------------------------
-
     if text == BTN_CHECK:
-
         await check_all(update)
+        return
 
+    if text == BTN_REMOVE:
+        context.user_data["mode"] = "remove_uid"
+        await update.message.reply_text(
+            "❌ Gửi UID cần xóa."
+        )
         return
 
     mode = context.user_data.get("mode")
 
-    # =====================================================
-    # NHẬN ID MỚI
-    # =====================================================
-
-    if mode == "add":
-
-        fb_id = text.strip()
-
-        if not fb_id.isdigit():
-
+    if mode == "add_uid":
+        if not text.isdigit():
             await update.message.reply_text(
-                "⚠️ Facebook ID phải là dãy số.\n\n"
-                "Ví dụ:\n"
-                "1000123456789"
+                "⚠️ UID phải là dãy số."
             )
-
             return
 
+        context.user_data["new_uid"] = text
+        context.user_data["mode"] = "add_name"
         await update.message.reply_text(
-            "⏳ Đang kiểm tra Facebook ID..."
+            "👤 Nhập tên hiển thị cho UID.\n"
+            "Nếu không cần, gửi dấu -"
         )
-
-        status = check_facebook(fb_id)
-
-        now = datetime.now().strftime(
-            "%d/%m/%Y %H:%M"
-        )
-
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO accounts
-            (
-                fb_id,
-                status,
-                last_check
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                fb_id,
-                status,
-                now
-            )
-        )
-
-        con.commit()
-        con.close()
-
-        context.user_data["mode"] = None
-
-        await update.message.reply_text(
-            "✅ ĐÃ THÊM FACEBOOK ID\n\n"
-            f"🆔 {fb_id}\n"
-            f"{status_text(status)}",
-            reply_markup=keyboard()
-        )
-
         return
 
-    # =====================================================
-    # XÓA ID
-    # =====================================================
-
-    if mode == "remove":
-
-        fb_id = text.strip()
-
-        con = sqlite3.connect(DB_FILE)
-        cur = con.cursor()
-
-        cur.execute(
-            "DELETE FROM accounts "
-            "WHERE fb_id = ?",
-            (fb_id,)
+    if mode == "add_name":
+        context.user_data["new_name"] = "" if text == "-" else text
+        context.user_data["mode"] = "add_note"
+        await update.message.reply_text(
+            "📝 Nhập ghi chú.\n"
+            "Nếu không cần, gửi dấu -"
         )
+        return
 
-        deleted = cur.rowcount
+    if mode == "add_note":
+        context.user_data["new_note"] = "" if text == "-" else text
+        context.user_data["mode"] = "add_price"
+        await update.message.reply_text(
+            "💵 Nhập giá, ví dụ: 99.999đ\n"
+            "Nếu không cần, gửi 0"
+        )
+        return
 
+    if mode == "add_price":
+        fb_id = context.user_data["new_uid"]
+        name = context.user_data.get("new_name", "")
+        note = context.user_data.get("new_note", "")
+        price = text
+
+        await update.message.reply_text("⏳ Đang kiểm tra UID...")
+
+        status = check_facebook(fb_id)
+        created = now_text()
+
+        con = db()
+        cur = con.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO accounts
+            (fb_id,name,note,price,status,created_at,last_check)
+            VALUES(?,?,?,?,?,?,?)
+        """, (
+            fb_id,
+            name,
+            note,
+            price,
+            status,
+            created,
+            created
+        ))
         con.commit()
         con.close()
 
-        context.user_data["mode"] = None
+        row = get_account(fb_id)
 
-        if deleted:
+        context.user_data.clear()
 
-            await update.message.reply_text(
-                "🗑 ĐÃ XÓA\n\n"
-                f"ID: {fb_id}",
-                reply_markup=keyboard()
-            )
+        await update.message.reply_text(
+            format_ticket(row),
+            reply_markup=keyboard()
+        )
+        return
 
-        else:
+    if mode == "remove_uid":
+        con = db()
+        cur = con.cursor()
+        cur.execute(
+            "DELETE FROM accounts WHERE fb_id=?",
+            (text,)
+        )
+        deleted = cur.rowcount
+        con.commit()
+        con.close()
 
-            await update.message.reply_text(
-                "⚠️ Không tìm thấy ID này.",
-                reply_markup=keyboard()
-            )
+        context.user_data.clear()
 
+        await update.message.reply_text(
+            "✅ Đã xóa UID."
+            if deleted
+            else "⚠️ Không tìm thấy UID này.",
+            reply_markup=keyboard()
+        )
         return
 
     await update.message.reply_text(
-        "👇 Hãy chọn chức năng bên dưới.",
+        "👇 Chọn chức năng bên dưới.",
         reply_markup=keyboard()
     )
 
-
-# =========================================================
-# TỰ ĐỘNG KIỂM TRA
-# =========================================================
-
-async def auto_monitor(
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    con = sqlite3.connect(DB_FILE)
+async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
+    con = db()
     cur = con.cursor()
 
-    cur.execute(
-        "SELECT fb_id, status "
-        "FROM accounts"
-    )
-
+    cur.execute("""
+        SELECT fb_id,status
+        FROM accounts
+    """)
     rows = cur.fetchall()
 
     for fb_id, old_status in rows:
-
         new_status = check_facebook(fb_id)
-        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now = now_text()
 
-        # UNKNOWN thường là lỗi mạng/chặn tạm thời:
-        # chỉ cập nhật thời gian, không đổi trạng thái và không cảnh báo.
         if new_status == "UNKNOWN":
-            cur.execute(
-                """
-                UPDATE accounts
-                SET last_check = ?
-                WHERE fb_id = ?
-                """,
-                (now, fb_id)
-            )
             pending_changes.pop(fb_id, None)
+
+            cur.execute("""
+                UPDATE accounts
+                SET last_check=?
+                WHERE fb_id=?
+            """, (now, fb_id))
             continue
 
-        # Không thay đổi: xóa bộ đếm xác nhận và chỉ cập nhật thời gian.
         if not old_status or new_status == old_status:
             pending_changes.pop(fb_id, None)
 
-            cur.execute(
-                """
+            cur.execute("""
                 UPDATE accounts
-                SET status = ?, last_check = ?
-                WHERE fb_id = ?
-                """,
-                (new_status, now, fb_id)
-            )
+                SET status=?, last_check=?
+                WHERE fb_id=?
+            """, (
+                new_status,
+                now,
+                fb_id
+            ))
             continue
 
-        # Có thay đổi: phải thấy cùng trạng thái mới 2 lần liên tiếp.
         pending_status, count = pending_changes.get(
-            fb_id, (None, 0)
+            fb_id,
+            (None, 0)
         )
 
         if pending_status == new_status:
@@ -527,113 +407,89 @@ async def auto_monitor(
             pending_status = new_status
             count = 1
 
-        pending_changes[fb_id] = (pending_status, count)
-
-        # Lần đầu chỉ ghi nhận nghi ngờ, chưa đổi trạng thái chính thức.
-        if count < 2:
-            cur.execute(
-                """
-                UPDATE accounts
-                SET last_check = ?
-                WHERE fb_id = ?
-                """,
-                (now, fb_id)
-            )
-            continue
-
-        # Xác nhận lần 2: đổi trạng thái chính thức và gửi cảnh báo.
-        cur.execute(
-            """
-            UPDATE accounts
-            SET status = ?, last_check = ?
-            WHERE fb_id = ?
-            """,
-            (new_status, now, fb_id)
+        pending_changes[fb_id] = (
+            pending_status,
+            count
         )
 
+        if count < 2:
+            continue
+
+        cur.execute("""
+            UPDATE accounts
+            SET status=?, last_check=?
+            WHERE fb_id=?
+        """, (
+            new_status,
+            now,
+            fb_id
+        ))
+
         pending_changes.pop(fb_id, None)
+        con.commit()
+
+        row = get_account(fb_id)
 
         chat_id = context.application.bot_data.get("chat_id")
 
         if chat_id:
             if new_status == "UNAVAILABLE":
-                message = (
-                    "🚨 FACEBOOK KHÔNG CÒN TRUY CẬP ĐƯỢC\n\n"
-                    f"🆔 ID: {fb_id}\n"
-                    "🔴 Link/profile hiện không truy cập được."
-                )
+                title = "🚨 UID ĐÃ CHUYỂN TỪ LIVE → DIE"
             else:
-                message = (
-                    "✅ FACEBOOK HOẠT ĐỘNG TRỞ LẠI\n\n"
-                    f"🆔 ID: {fb_id}\n"
-                    "🟢 Link/profile đã truy cập được trở lại."
-                )
+                title = "✅ UID ĐÃ CHUYỂN TỪ DIE → LIVE"
 
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=message
+                text=f"{title}\n\n{format_ticket(row)}"
             )
 
     con.commit()
     con.close()
 
-
-# =========================================================
-# MAIN
-# =========================================================
+async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.application.bot_data["chat_id"] = update.effective_chat.id
 
 def main():
-
     if not TOKEN:
-
-        raise RuntimeError(
-            "Chưa thiết lập BOT_TOKEN trên Render."
-        )
+        raise RuntimeError("Chưa thiết lập BOT_TOKEN trên Render.")
 
     init_db()
 
-    # Chạy web server cho Render
     Thread(
         target=run_web,
         daemon=True
     ).start()
 
-    # Khởi tạo Telegram Bot
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .build()
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(
+        CommandHandler("start", start)
     )
 
     app.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            remember_chat
+        ),
+        group=-1
     )
 
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             message_handler
-        )
+        ),
+        group=0
     )
 
-    # Kiểm tra Facebook mỗi 30 giây
     app.job_queue.run_repeating(
         auto_monitor,
-        interval=30,
+        interval=CHECK_SECONDS,
         first=10
     )
 
-    print(
-        "Laptinh Facebook Monitor đang hoạt động..."
-    )
-
-    app.run_polling(
-        drop_pending_updates=True
-    )
-
+    print("Laptinh Facebook Monitor đang hoạt động...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
