@@ -175,12 +175,26 @@ def check_facebook(fb_id):
                 saw_blocked = True
                 continue
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(
+                "[FB_DIAG_ERROR]",
+                f"uid={fb_id}",
+                f"request_url={url}",
+                f"error_type={type(e).__name__}",
+                f"error={str(e)[:300]}",
+                flush=True
+            )
             saw_blocked = True
             continue
 
-    # Không ép LIVE/DIE khi Facebook không cho xác minh chắc chắn.
-    return "UNKNOWN" if saw_blocked else "UNKNOWN"
+    print(
+        "[FB_DIAG_RESULT]",
+        f"uid={fb_id}",
+        "result=UNKNOWN",
+        f"saw_blocked={saw_blocked}",
+        flush=True
+    )
+    return "UNKNOWN"
 
 def keyboard():
     return ReplyKeyboardMarkup(
