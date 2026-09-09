@@ -8,14 +8,15 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
-DB_FILE = "facebook_pro.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "facebook_pro.db")
 CHECK_SECONDS = 30
 TRIAL_DAYS = 15
 TRIAL_UID_LIMIT = 5
@@ -24,10 +25,10 @@ VIP_DAYS = 30
 VIP_UID_LIMIT = 50
 VN_TZ = timezone(timedelta(hours=7))
 
-# Trên Render, tạo ADMIN_ID = Telegram numeric user ID của chủ bot.
+# ADMIN_ID = Telegram numeric user ID của chủ bot.
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 
-# Thông tin nhận chuyển khoản. Cấu hình trên Render Environment.
+# Thông tin nhận chuyển khoản. Cấu hình bằng biến môi trường/.env.
 # BANK_BIN: mã BIN ngân hàng, ví dụ MB = 970422, Vietcombank = 970436...
 BANK_BIN = os.environ.get("BANK_BIN", "").strip()
 BANK_ACCOUNT = os.environ.get("BANK_ACCOUNT", "").strip()
@@ -63,6 +64,9 @@ def run_web():
 def db():
     con = sqlite3.connect(DB_FILE, timeout=30)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     return con
 
 
@@ -1191,6 +1195,151 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
             print("[TG_SEND_ERROR]", user_id, fb_id, type(e).__name__, flush=True)
 
 
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    text = (
+        "📚 HƯỚNG DẪN SỬ DỤNG\n\n"
+        "/start - Khởi động bot\n"
+        "/help - Hướng dẫn sử dụng\n"
+        "/add - Thêm Facebook UID\n"
+        "/list - Danh sách UID đang theo dõi\n"
+        "/search TỪ_KHÓA - Tìm theo UID / tên / ghi chú\n"
+        "/check - Kiểm tra ngay toàn bộ UID\n"
+        "/history - Lịch sử chuyển trạng thái\n"
+        "/remove - Xóa UID\n"
+        "/account - Thông tin tài khoản\n"
+        "/renew - Nâng cấp / gia hạn VIP\n\n"
+        "ℹ️ LIVE/DIE là tín hiệu khả dụng công khai của UID, "
+        "không phải trạng thái online/offline riêng tư."
+    )
+    if is_admin(update):
+        text += "\n\n🛠 Quản trị viên: dùng /admin để xem lệnh quản trị."
+    await update.message.reply_text(text, reply_markup=keyboard())
+
+
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = await require_active(update)
+    if not row:
+        return
+
+    user_id = update.effective_user.id
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM monitored_accounts WHERE telegram_user_id=?",
+        (user_id,)
+    )
+    count = cur.fetchone()["c"]
+    con.close()
+
+    if count >= row["uid_limit"]:
+        await update.message.reply_text(
+            f"⚠️ Bạn đã dùng đủ {row['uid_limit']} UID của gói hiện tại.",
+            reply_markup=keyboard()
+        )
+        return
+
+    context.user_data.clear()
+    context.user_data["mode"] = "add_uid"
+    await update.message.reply_text(
+        "➕ Gửi UID hoặc link Facebook có UID số.\n"
+        "Ví dụ:\n100003606221946\n"
+        "https://facebook.com/100003606221946"
+    )
+
+
+async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    context.user_data.clear()
+    context.user_data["mode"] = "remove_uid"
+    await update.message.reply_text("❌ Gửi UID cần xóa.", reply_markup=keyboard())
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    await list_accounts(update)
+
+
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await check_all(update)
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    await show_history(update)
+
+
+async def account_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await account_info(update)
+
+
+async def renew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await renew_account(update, context)
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    query = " ".join(context.args).strip()
+
+    if not query:
+        await update.message.reply_text(
+            "🔎 Dùng: /search TỪ_KHÓA\n"
+            "Có thể tìm theo UID, tên hoặc ghi chú.",
+            reply_markup=keyboard()
+        )
+        return
+
+    user_id = update.effective_user.id
+    like = f"%{query}%"
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT * FROM monitored_accounts
+        WHERE telegram_user_id=?
+          AND (
+              fb_id LIKE ? COLLATE NOCASE
+              OR COALESCE(name, '') LIKE ? COLLATE NOCASE
+              OR COALESCE(note, '') LIKE ? COLLATE NOCASE
+          )
+        ORDER BY created_at DESC
+        LIMIT 20
+    """, (user_id, like, like, like))
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+        await update.message.reply_text(
+            f"📭 Không tìm thấy kết quả cho: {query}",
+            reply_markup=keyboard()
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔎 Tìm thấy {len(rows)} kết quả cho: {query}",
+        reply_markup=keyboard()
+    )
+    for row in rows:
+        await send_account_ticket(update.message, row)
+
+
+async def setup_commands(app):
+    commands = [
+        BotCommand("start", "🚀 Khởi động bot"),
+        BotCommand("help", "📚 Hướng dẫn sử dụng"),
+        BotCommand("add", "➕ Thêm tài khoản Facebook"),
+        BotCommand("list", "📋 Danh sách Facebook"),
+        BotCommand("search", "🔎 Tìm UID theo tên/note"),
+        BotCommand("check", "🔍 Kiểm tra ngay"),
+        BotCommand("history", "📜 Lịch sử chuyển trạng thái"),
+        BotCommand("remove", "❌ Xóa tài khoản"),
+        BotCommand("account", "👤 Thông tin tài khoản"),
+        BotCommand("renew", "💳 Nâng cấp / gia hạn VIP"),
+    ]
+    await app.bot.set_my_commands(commands)
+
+
 def is_admin(update: Update):
     return bool(ADMIN_ID and update.effective_user.id == ADMIN_ID)
 
@@ -1390,14 +1539,27 @@ async def unlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TOKEN:
-        raise RuntimeError("Chưa thiết lập BOT_TOKEN trên Render.")
+        raise RuntimeError("Chưa thiết lập BOT_TOKEN trong biến môi trường.")
 
     init_db()
     Thread(target=run_web, daemon=True).start()
 
-    app = Application.builder().token(TOKEN).build()
+    async def post_init(application):
+        await setup_commands(application)
+        print("[COMMAND_MENU] Telegram command menu updated", flush=True)
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("account", account_cmd))
+    app.add_handler(CommandHandler("renew", renew_cmd))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("extend", extend_cmd))
@@ -1417,7 +1579,8 @@ def main():
         first=10
     )
 
-    print("Laptinh FB Monitor PRO đang hoạt động...")
+
+    print(f"Laptinh FB Monitor PRO V10 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
