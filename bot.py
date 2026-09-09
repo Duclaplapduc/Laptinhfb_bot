@@ -8,9 +8,9 @@ from datetime import datetime, timezone, timedelta
 from threading import Thread
 from flask import Flask
 
-from telegram import Update, ReplyKeyboardMarkup, BotCommand
+from telegram import Update, ReplyKeyboardMarkup, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
@@ -126,6 +126,17 @@ def init_db():
             reminder_key TEXT NOT NULL,
             sent_at TEXT NOT NULL,
             PRIMARY KEY (telegram_user_id, plan, expiry_key, reminder_key)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_audit(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_user_id INTEGER NOT NULL,
+            admin_user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -1081,6 +1092,130 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
 
+    mode = context.user_data.get("mode")
+
+    # Các bước nhập liệu riêng cho ADMIN.
+    if is_admin(update) and mode == "admin_search_customer":
+        q = text.lstrip("@").strip()
+        like = f"%{q}%"
+        con = db()
+        cur = con.cursor()
+        if q.isdigit():
+            cur.execute("""
+                SELECT u.*,
+                       (SELECT COUNT(*) FROM monitored_accounts a
+                        WHERE a.telegram_user_id=u.telegram_user_id) AS uid_count
+                FROM users u
+                WHERE CAST(u.telegram_user_id AS TEXT)=?
+                   OR COALESCE(u.full_name,'') LIKE ? COLLATE NOCASE
+                   OR COALESCE(u.username,'') LIKE ? COLLATE NOCASE
+                ORDER BY u.created_at DESC
+                LIMIT 10
+            """, (q, like, like))
+        else:
+            cur.execute("""
+                SELECT u.*,
+                       (SELECT COUNT(*) FROM monitored_accounts a
+                        WHERE a.telegram_user_id=u.telegram_user_id) AS uid_count
+                FROM users u
+                WHERE COALESCE(u.full_name,'') LIKE ? COLLATE NOCASE
+                   OR COALESCE(u.username,'') LIKE ? COLLATE NOCASE
+                ORDER BY u.created_at DESC
+                LIMIT 10
+            """, (like, like))
+        rows = cur.fetchall()
+        con.close()
+        context.user_data.clear()
+
+        if not rows:
+            await update.message.reply_text(
+                "📭 Không tìm thấy khách phù hợp.",
+                reply_markup=admin_menu_markup()
+            )
+            return
+
+        buttons = []
+        for r in rows:
+            name = (r["full_name"] or r["username"] or str(r["telegram_user_id"]))[:28]
+            buttons.append([
+                InlineKeyboardButton(
+                    f"👤 {name} • {r['plan']} • {r['uid_count']}/{r['uid_limit']}",
+                    callback_data=f"adm:user:{r['telegram_user_id']}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton("🏠 Menu ADMIN", callback_data="adm:home")])
+        await update.message.reply_text(
+            f"🔎 Tìm thấy <b>{len(rows)}</b> khách:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if is_admin(update) and mode == "admin_extend_days":
+        target = context.user_data.get("admin_target")
+        if not text.isdigit() or int(text) < 1 or int(text) > 3650:
+            await update.message.reply_text("⚠️ Hãy gửi số ngày từ 1 đến 3650.")
+            return
+
+        days = int(text)
+        row = admin_customer_row(target)
+        if not row:
+            context.user_data.clear()
+            await update.message.reply_text("⚠️ Không tìm thấy khách.", reply_markup=admin_menu_markup())
+            return
+
+        old_exp = parse_dt(row["expires_at"])
+        base = old_exp if old_exp and old_exp > now_dt() else now_dt()
+        new_exp = add_days_text(base, days)
+
+        con = db()
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE users
+            SET expires_at=?, is_active=1, plan='VIP'
+            WHERE telegram_user_id=?
+        """, (new_exp, target))
+        con.commit()
+        con.close()
+
+        admin_log(target, user_id, "EXTEND", f"+{days} ngày; hết hạn={new_exp}")
+        context.user_data.clear()
+        row = admin_customer_row(target)
+        await update.message.reply_text(
+            "✅ <b>ĐÃ GIA HẠN</b>\n\n" + customer_card_text(row),
+            parse_mode="HTML",
+            reply_markup=customer_actions_markup(row)
+        )
+        return
+
+    if is_admin(update) and mode == "admin_set_limit":
+        target = context.user_data.get("admin_target")
+        if not text.isdigit() or int(text) < 1 or int(text) > 100000:
+            await update.message.reply_text("⚠️ Hãy gửi giới hạn UID từ 1 đến 100000.")
+            return
+
+        limit_n = int(text)
+        con = db()
+        cur = con.cursor()
+        cur.execute("UPDATE users SET uid_limit=? WHERE telegram_user_id=?", (limit_n, target))
+        changed = cur.rowcount
+        con.commit()
+        con.close()
+
+        context.user_data.clear()
+        if not changed:
+            await update.message.reply_text("⚠️ Không tìm thấy khách.", reply_markup=admin_menu_markup())
+            return
+
+        admin_log(target, user_id, "LIMIT", f"uid_limit={limit_n}")
+        row = admin_customer_row(target)
+        await update.message.reply_text(
+            "✅ <b>ĐÃ ĐỔI GIỚI HẠN UID</b>\n\n" + customer_card_text(row),
+            parse_mode="HTML",
+            reply_markup=customer_actions_markup(row)
+        )
+        return
+
     if text == BTN_ACCOUNT:
         await account_info(update)
         return
@@ -1520,6 +1655,443 @@ async def setup_commands(app):
     await app.bot.set_my_commands(commands)
 
 
+
+def admin_log(target_user_id, admin_user_id, action, details=""):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO admin_audit(target_user_id, admin_user_id, action, details, created_at)
+        VALUES(?,?,?,?,?)
+    """, (target_user_id, admin_user_id, action, details, now_text()))
+    con.commit()
+    con.close()
+
+
+def admin_customer_row(target_user_id):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT u.*,
+               (SELECT COUNT(*) FROM monitored_accounts a
+                WHERE a.telegram_user_id=u.telegram_user_id) AS uid_count
+        FROM users u
+        WHERE u.telegram_user_id=?
+    """, (target_user_id,))
+    row = cur.fetchone()
+    con.close()
+    return row
+
+
+def admin_menu_markup():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 Khách hàng", callback_data="adm:list:0"),
+            InlineKeyboardButton("🔎 Tìm khách", callback_data="adm:search")
+        ],
+        [
+            InlineKeyboardButton("⏳ Sắp hết hạn", callback_data="adm:expiring:0"),
+            InlineKeyboardButton("🔒 Đang khóa", callback_data="adm:locked:0")
+        ],
+        [
+            InlineKeyboardButton("📊 Thống kê", callback_data="adm:stats")
+        ]
+    ])
+
+
+def customer_actions_markup(row):
+    uid = row["telegram_user_id"]
+    lock_label = "🔓 Mở khóa" if not row["is_active"] else "🔒 Khóa"
+    lock_action = "unlock" if not row["is_active"] else "lock"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💎 VIP +30 ngày", callback_data=f"adm:vip:{uid}"),
+            InlineKeyboardButton("📅 Gia hạn khác", callback_data=f"adm:extend:{uid}")
+        ],
+        [
+            InlineKeyboardButton("📦 Đổi giới hạn", callback_data=f"adm:limit:{uid}"),
+            InlineKeyboardButton(lock_label, callback_data=f"adm:{lock_action}:{uid}")
+        ],
+        [
+            InlineKeyboardButton("📋 Xem UID", callback_data=f"adm:uids:{uid}"),
+            InlineKeyboardButton("🧾 Lịch sử", callback_data=f"adm:audit:{uid}")
+        ],
+        [
+            InlineKeyboardButton("🔄 Làm mới", callback_data=f"adm:user:{uid}"),
+            InlineKeyboardButton("⬅️ Danh sách", callback_data="adm:list:0")
+        ]
+    ])
+
+
+def customer_card_text(row):
+    if not row:
+        return "⚠️ Không tìm thấy khách hàng."
+
+    expires = parse_dt(row["expires_at"])
+    if row["plan"] == "ADMIN":
+        remain = "Không giới hạn"
+    elif not row["is_active"]:
+        remain = "Đang khóa"
+    elif not expires or expires < now_dt():
+        remain = "Đã hết hạn"
+    else:
+        remain = remaining_text(row)
+
+    username = f"@{row['username']}" if row["username"] else "-"
+    status = "🟢 Hoạt động" if row["is_active"] else "🔴 Đã khóa"
+
+    return (
+        "👤 <b>THÔNG TIN KHÁCH HÀNG</b>\n\n"
+        f"🆔 Telegram ID: <code>{row['telegram_user_id']}</code>\n"
+        f"👤 Tên: <b>{html.escape(row['full_name'] or '-')}</b>\n"
+        f"🔗 Username: <b>{html.escape(username)}</b>\n"
+        f"💎 Gói: <b>{html.escape(row['plan'])}</b>\n"
+        f"📊 UID: <b>{row['uid_count']}/{row['uid_limit']}</b>\n"
+        f"📅 Hết hạn: <b>{html.escape(str(row['expires_at']))}</b>\n"
+        f"⏳ Còn lại: <b>{html.escape(remain)}</b>\n"
+        f"🔐 Trạng thái: <b>{status}</b>\n"
+        f"🗓 Ngày tạo: <b>{html.escape(str(row['created_at']))}</b>"
+    )
+
+
+def admin_customer_list(page=0, mode="all"):
+    per_page = 8
+    page = max(0, int(page or 0))
+    offset = page * per_page
+
+    where = ""
+    args = []
+    title = "👥 <b>KHÁCH HÀNG</b>"
+
+    if mode == "locked":
+        where = "WHERE u.is_active=0"
+        title = "🔒 <b>KHÁCH ĐANG KHÓA</b>"
+    elif mode == "expiring":
+        deadline = add_days_text(now_dt(), 7)
+        where = "WHERE u.plan IN ('TRIAL','VIP') AND u.is_active=1 AND u.expires_at>=? AND u.expires_at<=?"
+        args = [now_text(), deadline]
+        title = "⏳ <b>KHÁCH SẮP HẾT HẠN ≤ 7 NGÀY</b>"
+
+    con = db()
+    cur = con.cursor()
+    cur.execute(f"SELECT COUNT(*) AS c FROM users u {where}", args)
+    total = cur.fetchone()["c"]
+
+    cur.execute(f"""
+        SELECT u.*,
+               (SELECT COUNT(*) FROM monitored_accounts a
+                WHERE a.telegram_user_id=u.telegram_user_id) AS uid_count
+        FROM users u
+        {where}
+        ORDER BY u.created_at DESC
+        LIMIT ? OFFSET ?
+    """, args + [per_page, offset])
+    rows = cur.fetchall()
+    con.close()
+
+    buttons = []
+    for r in rows:
+        name = (r["full_name"] or r["username"] or str(r["telegram_user_id"]))[:24]
+        icon = "🔴" if not r["is_active"] else ("💎" if r["plan"] == "VIP" else "🎁")
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {name} • {r['uid_count']}/{r['uid_limit']}",
+                callback_data=f"adm:user:{r['telegram_user_id']}"
+            )
+        ])
+
+    nav = []
+    prefix = "list" if mode == "all" else mode
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Trước", callback_data=f"adm:{prefix}:{page-1}"))
+    if offset + per_page < total:
+        nav.append(InlineKeyboardButton("Sau ➡️", callback_data=f"adm:{prefix}:{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("🏠 Menu ADMIN", callback_data="adm:home")])
+
+    text = (
+        f"{title}\n\n"
+        f"📊 Tổng: <b>{total}</b>\n"
+        f"📄 Trang: <b>{page + 1}</b>\n\n"
+        "👇 Bấm vào khách để quản lý."
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def admin_send_stats(target_message):
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM users")
+    total = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM users WHERE plan='TRIAL'")
+    trial = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM users WHERE plan='VIP'")
+    vip = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM users WHERE is_active=0")
+    locked = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM monitored_accounts")
+    uids = cur.fetchone()["c"]
+    cur.execute("""
+        SELECT COUNT(*) AS c FROM users
+        WHERE plan IN ('TRIAL','VIP') AND is_active=1
+          AND expires_at>=? AND expires_at<=?
+    """, (now_text(), add_days_text(now_dt(), 7)))
+    expiring = cur.fetchone()["c"]
+    con.close()
+
+    text = (
+        "📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n"
+        f"👥 Tổng tài khoản: <b>{total}</b>\n"
+        f"🎁 TRIAL: <b>{trial}</b>\n"
+        f"💎 VIP: <b>{vip}</b>\n"
+        f"⏳ Sắp hết hạn ≤ 7 ngày: <b>{expiring}</b>\n"
+        f"🔒 Đang khóa: <b>{locked}</b>\n"
+        f"🆔 Tổng UID theo dõi: <b>{uids}</b>"
+    )
+    await target_message.reply_text(text, parse_mode="HTML", reply_markup=admin_menu_markup())
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Bạn không có quyền quản trị.", show_alert=True)
+        return
+
+    await query.answer()
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "adm":
+        return
+
+    action = parts[1]
+
+    if action == "home":
+        await query.edit_message_text(
+            "🛠 <b>ADMIN - LAPTINH FB MONITOR PRO</b>\n\n"
+            "Quản lý khách hàng bằng nút bấm:",
+            parse_mode="HTML",
+            reply_markup=admin_menu_markup()
+        )
+        return
+
+    if action in ("list", "locked", "expiring"):
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        mode = "all" if action == "list" else action
+        text, markup = admin_customer_list(page, mode)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if action == "stats":
+        con = db()
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) AS c FROM users")
+        total = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM users WHERE plan='TRIAL'")
+        trial = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM users WHERE plan='VIP'")
+        vip = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM users WHERE is_active=0")
+        locked = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM monitored_accounts")
+        uids = cur.fetchone()["c"]
+        cur.execute("""
+            SELECT COUNT(*) AS c FROM users
+            WHERE plan IN ('TRIAL','VIP') AND is_active=1
+              AND expires_at>=? AND expires_at<=?
+        """, (now_text(), add_days_text(now_dt(), 7)))
+        expiring = cur.fetchone()["c"]
+        con.close()
+
+        text = (
+            "📊 <b>THỐNG KÊ HỆ THỐNG</b>\n\n"
+            f"👥 Tổng tài khoản: <b>{total}</b>\n"
+            f"🎁 TRIAL: <b>{trial}</b>\n"
+            f"💎 VIP: <b>{vip}</b>\n"
+            f"⏳ Sắp hết hạn ≤ 7 ngày: <b>{expiring}</b>\n"
+            f"🔒 Đang khóa: <b>{locked}</b>\n"
+            f"🆔 Tổng UID theo dõi: <b>{uids}</b>"
+        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_menu_markup())
+        return
+
+    if action == "search":
+        context.user_data.clear()
+        context.user_data["mode"] = "admin_search_customer"
+        await query.edit_message_text(
+            "🔎 <b>TÌM KHÁCH HÀNG</b>\n\n"
+            "Gửi Telegram ID, tên hoặc @username của khách.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Menu ADMIN", callback_data="adm:home")]
+            ])
+        )
+        return
+
+    if len(parts) < 3 or not parts[2].isdigit():
+        return
+
+    target = int(parts[2])
+    row = admin_customer_row(target)
+    if not row:
+        await query.edit_message_text(
+            "⚠️ Không tìm thấy khách hàng.",
+            reply_markup=admin_menu_markup()
+        )
+        return
+
+    if action == "user":
+        await query.edit_message_text(
+            customer_card_text(row),
+            parse_mode="HTML",
+            reply_markup=customer_actions_markup(row)
+        )
+        return
+
+    if action == "vip":
+        old_exp = parse_dt(row["expires_at"])
+        base = old_exp if old_exp and old_exp > now_dt() else now_dt()
+        new_exp = add_days_text(base, VIP_DAYS)
+
+        con = db()
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE users
+            SET expires_at=?, is_active=1, plan='VIP', uid_limit=?
+            WHERE telegram_user_id=?
+        """, (new_exp, VIP_UID_LIMIT, target))
+        con.commit()
+        con.close()
+
+        admin_log(target, query.from_user.id, "VIP", f"+{VIP_DAYS} ngày; limit={VIP_UID_LIMIT}; hết hạn={new_exp}")
+        row = admin_customer_row(target)
+        await query.edit_message_text(
+            "✅ <b>ĐÃ KÍCH HOẠT/GIA HẠN VIP</b>\n\n" + customer_card_text(row),
+            parse_mode="HTML",
+            reply_markup=customer_actions_markup(row)
+        )
+        return
+
+    if action == "extend":
+        context.user_data.clear()
+        context.user_data["mode"] = "admin_extend_days"
+        context.user_data["admin_target"] = target
+        await query.edit_message_text(
+            f"📅 <b>GIA HẠN TÙY CHỌN</b>\n\n"
+            f"Khách: <code>{target}</code>\n"
+            "Gửi số ngày muốn cộng, ví dụ: <code>15</code>, <code>30</code>, <code>90</code>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Quay lại", callback_data=f"adm:user:{target}")]
+            ])
+        )
+        return
+
+    if action == "limit":
+        context.user_data.clear()
+        context.user_data["mode"] = "admin_set_limit"
+        context.user_data["admin_target"] = target
+        await query.edit_message_text(
+            f"📦 <b>ĐỔI GIỚI HẠN UID</b>\n\n"
+            f"Khách: <code>{target}</code>\n"
+            f"Giới hạn hiện tại: <b>{row['uid_limit']} UID</b>\n\n"
+            "Gửi giới hạn mới, ví dụ: <code>100</code> hoặc <code>1000</code>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Quay lại", callback_data=f"adm:user:{target}")]
+            ])
+        )
+        return
+
+    if action in ("lock", "unlock"):
+        new_active = 0 if action == "lock" else 1
+        con = db()
+        cur = con.cursor()
+        cur.execute("UPDATE users SET is_active=? WHERE telegram_user_id=?", (new_active, target))
+        con.commit()
+        con.close()
+
+        admin_log(target, query.from_user.id, action.upper(), "Khóa tài khoản" if not new_active else "Mở khóa tài khoản")
+        row = admin_customer_row(target)
+        await query.edit_message_text(
+            ("🔒 <b>ĐÃ KHÓA TÀI KHOẢN</b>\n\n" if not new_active else "🔓 <b>ĐÃ MỞ KHÓA TÀI KHOẢN</b>\n\n")
+            + customer_card_text(row),
+            parse_mode="HTML",
+            reply_markup=customer_actions_markup(row)
+        )
+        return
+
+    if action == "uids":
+        con = db()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT fb_id, name, note, last_status
+            FROM monitored_accounts
+            WHERE telegram_user_id=?
+            ORDER BY created_at DESC
+            LIMIT 30
+        """, (target,))
+        rows = cur.fetchall()
+        con.close()
+
+        if not rows:
+            text = "📋 <b>DANH SÁCH UID</b>\n\nKhách này chưa có UID nào."
+        else:
+            lines = [f"📋 <b>DANH SÁCH UID</b> • {html.escape(row['full_name'] or str(target))}\n"]
+            for i, a in enumerate(rows, 1):
+                label = html.escape(a["name"] or "-")
+                status = html.escape(a["last_status"] or "UNKNOWN")
+                link = html.escape(fb_profile_url(a["fb_id"]), quote=True)
+                lines.append(f'{i}. <a href="{link}">{a["fb_id"]}</a> • {label} • {status}')
+            text = "\n".join(lines)
+
+        await query.edit_message_text(
+            text[:4000],
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Quay lại khách", callback_data=f"adm:user:{target}")]
+            ])
+        )
+        return
+
+    if action == "audit":
+        con = db()
+        cur = con.cursor()
+        cur.execute("""
+            SELECT action, details, created_at
+            FROM admin_audit
+            WHERE target_user_id=?
+            ORDER BY id DESC
+            LIMIT 15
+        """, (target,))
+        logs = cur.fetchall()
+        con.close()
+
+        lines = ["🧾 <b>LỊCH SỬ QUẢN TRỊ</b>\n"]
+        if not logs:
+            lines.append("Chưa có thao tác quản trị nào được ghi nhận.")
+        else:
+            for x in logs:
+                lines.append(
+                    f"• <b>{html.escape(x['action'])}</b> — {html.escape(x['created_at'])}\n"
+                    f"  {html.escape(x['details'] or '-')}"
+                )
+
+        await query.edit_message_text(
+            "\n".join(lines)[:4000],
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Quay lại khách", callback_data=f"adm:user:{target}")]
+            ])
+        )
+        return
+
+
+
 def is_admin(update: Update):
     return bool(ADMIN_ID and update.effective_user.id == ADMIN_ID)
 
@@ -1529,31 +2101,12 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Bạn không có quyền quản trị.")
         return
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM users")
-    users = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM monitored_accounts")
-    accounts = cur.fetchone()["c"]
-    cur.execute("""
-        SELECT COUNT(*) AS c FROM users
-        WHERE is_active=1 AND expires_at>=?
-    """, (now_text(),))
-    active = cur.fetchone()["c"]
-    con.close()
-
     await update.message.reply_text(
-        "🛠 ADMIN - LAPTINH FB MONITOR PRO\n\n"
-        f"👥 Tổng khách: {users}\n"
-        f"✅ Khách còn hạn: {active}\n"
-        f"🆔 Tổng UID: {accounts}\n\n"
-        "Lệnh quản trị:\n"
-        "/users - danh sách khách\n"
-        "/vip TELEGRAM_ID - VIP 20.000đ / 30 ngày / 1000 UID\n"
-        "/extend TELEGRAM_ID DAYS - gia hạn tùy số ngày\n"
-        "/limit TELEGRAM_ID NUMBER - đổi giới hạn UID\n"
-        "/lock TELEGRAM_ID - khóa\n"
-        "/unlock TELEGRAM_ID - mở khóa"
+        "🛠 <b>ADMIN - LAPTINH FB MONITOR PRO</b>\n\n"
+        "Quản lý khách hàng bằng nút bấm.\n"
+        "Bạn không cần nhớ các lệnh /vip, /limit, /lock nữa.",
+        parse_mode="HTML",
+        reply_markup=admin_menu_markup()
     )
 
 
@@ -1561,33 +2114,8 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT u.*,
-               (SELECT COUNT(*) FROM monitored_accounts a
-                WHERE a.telegram_user_id=u.telegram_user_id) AS uid_count
-        FROM users u
-        ORDER BY u.created_at DESC
-        LIMIT 50
-    """)
-    rows = cur.fetchall()
-    con.close()
-
-    if not rows:
-        await update.message.reply_text("Chưa có khách.")
-        return
-
-    text = ["👥 DANH SÁCH KHÁCH\n"]
-    for r in rows:
-        text.append(
-            f"ID: {r['telegram_user_id']}\n"
-            f"Tên: {r['full_name'] or '-'}\n"
-            f"Gói: {r['plan']} | UID: {r['uid_count']}/{r['uid_limit']}\n"
-            f"Hết hạn: {r['expires_at']}\n"
-            f"Trạng thái: {'ON' if r['is_active'] else 'LOCK'}\n"
-        )
-    await update.message.reply_text("\n".join(text)[:4000])
+    text, markup = admin_customer_list(0, "all")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1621,6 +2149,7 @@ async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con.commit()
     con.close()
 
+    admin_log(target, update.effective_user.id, "EXTEND", f"+{days} ngày; hết hạn={new_exp}")
     await update.message.reply_text(f"✅ Đã gia hạn {days} ngày.\nHết hạn mới: {new_exp}")
 
 
@@ -1655,6 +2184,7 @@ async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con.commit()
     con.close()
 
+    admin_log(target, update.effective_user.id, "VIP", f"+{VIP_DAYS} ngày; limit={VIP_UID_LIMIT}; hết hạn={new_exp}")
     await update.message.reply_text(
         f"💎 Đã kích hoạt/gia hạn VIP cho {target}\n"
         f"📦 Giới hạn: {VIP_UID_LIMIT} UID\n"
@@ -1680,6 +2210,8 @@ async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     changed = cur.rowcount
     con.commit()
     con.close()
+    if changed:
+        admin_log(target, update.effective_user.id, "LIMIT", f"uid_limit={limit_n}")
     await update.message.reply_text(
         f"✅ Đã đặt giới hạn {limit_n} UID." if changed else "⚠️ Không tìm thấy khách."
     )
@@ -1698,6 +2230,8 @@ async def lock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     changed = cur.rowcount
     con.commit()
     con.close()
+    if changed:
+        admin_log(target, update.effective_user.id, "LOCK", "Khóa tài khoản")
     await update.message.reply_text("🔒 Đã khóa." if changed else "⚠️ Không tìm thấy khách.")
 
 
@@ -1714,6 +2248,8 @@ async def unlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     changed = cur.rowcount
     con.commit()
     con.close()
+    if changed:
+        admin_log(target, update.effective_user.id, "UNLOCK", "Mở khóa tài khoản")
     await update.message.reply_text("🔓 Đã mở khóa." if changed else "⚠️ Không tìm thấy khách.")
 
 
@@ -1748,6 +2284,8 @@ def main():
     app.add_handler(CommandHandler("lock", lock_cmd))
     app.add_handler(CommandHandler("unlock", unlock_cmd))
 
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^adm:"))
+
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler),
         group=0
@@ -1766,7 +2304,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V13 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V14 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
