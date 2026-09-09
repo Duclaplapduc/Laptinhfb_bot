@@ -18,11 +18,11 @@ TOKEN = os.environ.get("BOT_TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "facebook_pro.db")
 CHECK_SECONDS = 30
-TRIAL_DAYS = 15
-TRIAL_UID_LIMIT = 5
+TRIAL_DAYS = 30
+TRIAL_UID_LIMIT = 100
 VIP_PRICE = 30000
 VIP_DAYS = 30
-VIP_UID_LIMIT = 50
+VIP_UID_LIMIT = 1000
 VN_TZ = timezone(timedelta(hours=7))
 
 # ADMIN_ID = Telegram numeric user ID của chủ bot.
