@@ -34,7 +34,7 @@ BANK_BIN = os.environ.get("BANK_BIN", "").strip()
 BANK_ACCOUNT = os.environ.get("BANK_ACCOUNT", "").strip()
 BANK_NAME = os.environ.get("BANK_NAME", "").strip()
 
-BTN_ADD = "➕ Thêm UID"
+BTN_ADD = "➕ Thêm Facebook"
 BTN_LIST = "📋 Danh sách"
 BTN_CHECK = "🔎 Kiểm tra ngay"
 BTN_REMOVE = "❌ Xóa UID"
@@ -661,15 +661,20 @@ def get_account(user_id, fb_id):
 
 
 def fb_profile_url(fb_id):
-    """Tạo link profile Facebook công khai theo UID."""
-    return f"https://www.facebook.com/profile.php?id={str(fb_id).strip()}"
+    """Tạo link mở Facebook từ UID số hoặc URL profile công khai đã lưu."""
+    value = str(fb_id or "").strip()
+    if value.lower().startswith(("https://facebook.com/", "https://www.facebook.com/")):
+        return value
+    return f"https://www.facebook.com/profile.php?id={value}"
 
 
 def fb_uid_link(fb_id):
-    """UID màu xanh, bấm được trong Telegram HTML."""
-    uid = html.escape(str(fb_id).strip())
+    """UID/link Facebook màu xanh, bấm được trong Telegram HTML."""
+    value = str(fb_id).strip()
+    label = value if value.isdigit() else "Mở trang Facebook"
+    label = html.escape(label)
     url = html.escape(fb_profile_url(fb_id), quote=True)
-    return f'<a href="{url}">{uid}</a>'
+    return f'<a href="{url}">{label}</a>'
 
 
 def format_ticket(row):
@@ -858,7 +863,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Hết hạn dùng thử: <b>{html.escape(str(row['expires_at']))}</b>\n"
             f"⏳ Còn lại: <b>{html.escape(remaining_text(row))}</b>\n\n"
             "🚀 <b>BẮT ĐẦU SỬ DỤNG</b>\n"
-            "1️⃣ Bấm <b>➕ Thêm UID</b>\n"
+            "1️⃣ Bấm <b>➕ Thêm Facebook</b>\n"
             "2️⃣ Gửi UID hoặc link Facebook có UID số\n"
             "3️⃣ Nhập tên, ghi chú và giá nếu cần\n"
             "4️⃣ Bot sẽ tự động theo dõi LIVE/DIE\n\n"
@@ -1038,7 +1043,7 @@ async def check_all(update: Update):
 
     for item in rows:
         fb_id = item["fb_id"]
-        status = check_facebook(fb_id)
+        status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN"
         now = now_text()
 
         con = db()
@@ -1067,22 +1072,49 @@ def normalize_uid_input(text):
     Chấp nhận:
     - UID số
     - facebook.com/UID
-    - https://facebook.com/UID
-    - www.facebook.com/UID
-    Chưa tự phân giải username -> UID nếu URL không chứa UID số.
+    - profile.php?id=UID
+    - link Facebook dạng facebook.com/username
+
+    Với link username/nickname không có UID số, bot lưu URL công khai để
+    người dùng có thể mở Facebook. Bộ kiểm tra LIVE/DIE hiện tại chỉ chạy
+    khi giá trị lưu là UID số.
     """
     raw = (text or "").strip()
+    if not raw:
+        return None
 
     if raw.isdigit():
         return raw
 
+    # Link chứa profile.php?id=UID hoặc query id=UID.
+    m = re.search(r'[?&]id=(\d{5,})', raw, flags=re.I)
+    if m:
+        return m.group(1)
+
+    # Link facebook.com/UID.
     m = re.search(
-        r'(?:https?://)?(?:www\.|m\.)?facebook\.com/(\d{5,})',
+        r'(?:https?://)?(?:www\.|m\.)?facebook\.com/(\d{5,})(?:[/?#]|$)',
         raw,
         flags=re.I
     )
     if m:
         return m.group(1)
+
+    # Chuẩn hóa link Facebook username/nickname.
+    candidate = raw
+    if re.match(r'^(?:www\.|m\.)?facebook\.com/', candidate, flags=re.I):
+        candidate = "https://" + candidate
+
+    m = re.match(
+        r'^https?://(?:www\.|m\.)?facebook\.com/([^?#]+)',
+        candidate,
+        flags=re.I
+    )
+    if m:
+        path = m.group(1).strip("/")
+        if path:
+            # Bỏ query/fragment, chỉ lưu URL profile công khai.
+            return "https://www.facebook.com/" + path
 
     return None
 
@@ -1258,7 +1290,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["mode"] = "add_uid"
-        await update.message.reply_text("➕ Gửi UID hoặc link Facebook có UID số.\nVí dụ:\n100003606221946\nhttps://facebook.com/100003606221946")
+        await update.message.reply_text("➕ Gửi UID số hoặc link Facebook.\n\nVí dụ:\n100003606221946\nhttps://facebook.com/100003606221946\nhttps://facebook.com/tennguoidung")
         return
 
     if text == BTN_REMOVE:
@@ -1272,11 +1304,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed_uid = normalize_uid_input(text)
         if not parsed_uid:
             await update.message.reply_text(
-                "⚠️ Chưa lấy được UID. Hãy gửi UID số hoặc link Facebook có UID số."
+                "⚠️ Chưa nhận diện được. Hãy gửi UID số hoặc một link Facebook hợp lệ."
             )
             return
 
         text = parsed_uid
+
+        if text.startswith("https://www.facebook.com/"):
+            await update.message.reply_text(
+                "🔗 Đã nhận link Facebook dạng username/nickname.\n"
+                "ℹ️ Bot sẽ lưu link để mở Facebook. LIVE/DIE chỉ được kiểm tra khi có UID số."
+            )
 
         if get_account(user_id, text):
             await update.message.reply_text(
@@ -1315,7 +1353,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = text
 
         await update.message.reply_text("⏳ Đang kiểm tra UID...")
-        status = check_facebook(fb_id)
+        status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN"
         created = now_text()
 
         con = db()
@@ -1393,7 +1431,7 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
         user_id = row["telegram_user_id"]
         fb_id = row["fb_id"]
         old_status = row["status"]
-        new_status = check_facebook(fb_id)
+        new_status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN" if str(fb_id).isdigit() else "UNKNOWN"
         now = now_text()
         key = (user_id, fb_id)
 
@@ -2045,7 +2083,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 label = html.escape(a["name"] or "-")
                 status = html.escape(a["last_status"] or "UNKNOWN")
                 link = html.escape(fb_profile_url(a["fb_id"]), quote=True)
-                lines.append(f'{i}. <a href="{link}">{a["fb_id"]}</a> • {label} • {status}')
+                fb_label = a["fb_id"] if str(a["fb_id"]).isdigit() else "Mở trang Facebook"
+                lines.append(f'{i}. <a href="{link}">{html.escape(str(fb_label))}</a> • {label} • {status}')
             text = "\n".join(lines)
 
         await query.edit_message_text(
@@ -2304,7 +2343,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V14 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V15 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
