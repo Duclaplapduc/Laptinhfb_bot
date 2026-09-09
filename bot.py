@@ -1392,7 +1392,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 Tổng UID: {accounts}\n\n"
         "Lệnh quản trị:\n"
         "/users - danh sách khách\n"
-        "/vip TELEGRAM_ID - VIP 30 ngày / 50 UID\n"
+        "/vip TELEGRAM_ID - VIP 20.000đ / 30 ngày / 1000 UID\n"
         "/extend TELEGRAM_ID DAYS - gia hạn tùy số ngày\n"
         "/limit TELEGRAM_ID NUMBER - đổi giới hạn UID\n"
         "/lock TELEGRAM_ID - khóa\n"
@@ -1469,7 +1469,7 @@ async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kích hoạt/gia hạn đúng gói VIP mặc định: 30.000đ / 30 ngày / 50 UID."""
+    """Kích hoạt/gia hạn gói VIP: 20.000đ / 30 ngày / 1000 UID."""
     if not is_admin(update):
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
