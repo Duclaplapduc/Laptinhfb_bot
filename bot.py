@@ -485,46 +485,72 @@ async def send_account_ticket(message, row):
 
 def check_facebook(fb_id):
     """
-    Dùng cùng tín hiệu public Graph profile-picture đã thử nghiệm:
-    URL cuối có '100x100' => AVAILABLE.
-    Lỗi request => UNKNOWN, không biến lỗi mạng thành DIE.
+    Heuristic công khai:
+    - UID số: dùng graph.facebook.com/{uid}/picture?type=normal như trước.
+    - Link username/nickname: kiểm tra trực tiếp URL profile công khai.
+    LIVE/DIE ở đây chỉ là khả dụng công khai, không phải online/offline.
     """
-    url = f"https://graph.facebook.com/{fb_id}/picture?type=normal"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/139.0.0.0 Safari/537.36"
-        )
-    }
+    value = str(fb_id or "").strip()
 
     try:
-        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-        final_url = r.url
+        if value.isdigit():
+            url = f"https://graph.facebook.com/{value}/picture?type=normal"
+            r = requests.get(
+                url,
+                timeout=10,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            final_url = str(r.url or "")
+            if "100x100" in final_url:
+                return "LIVE"
+            if r.status_code >= 400:
+                return "DIE"
+            return "DIE"
 
-        print(
-            "[FB_CHECK]",
-            f"uid={fb_id}",
-            f"http={r.status_code}",
-            f"final_url={final_url}",
-            flush=True
-        )
+        # Username/nickname URL: chỉ kiểm tra trang công khai, không đăng nhập/cookie.
+        if value.lower().startswith(("https://facebook.com/", "https://www.facebook.com/")):
+            r = requests.get(
+                value,
+                timeout=10,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/139.0.0.0 Safari/537.36"
+                    )
+                }
+            )
 
-        if "100x100" in final_url.lower():
-            return "AVAILABLE"
+            # Facebook có thể trả trang login/challenge dù profile tồn tại,
+            # nên chỉ dùng tín hiệu công khai thận trọng.
+            final_url = str(r.url or "").lower()
+            body = (r.text or "").lower()
 
-        return "UNAVAILABLE"
+            if r.status_code == 404:
+                return "DIE"
 
-    except requests.RequestException as e:
-        print(
-            "[FB_CHECK_ERROR]",
-            f"uid={fb_id}",
-            f"error_type={type(e).__name__}",
-            f"error={str(e)[:200]}",
-            flush=True
-        )
+            unavailable_markers = (
+                "content isn't available",
+                "this content isn't available",
+                "page isn't available",
+                "sorry, this content isn't available",
+            )
+            if any(x in body for x in unavailable_markers):
+                return "DIE"
+
+            # Nếu truy cập được trang/profile mà không rơi vào lỗi rõ ràng,
+            # coi là LIVE theo nghĩa "profile công khai khả dụng".
+            if r.status_code < 400 and "facebook.com" in final_url:
+                return "LIVE"
+
+            return "UNKNOWN"
+
         return "UNKNOWN"
 
+    except requests.RequestException:
+        return "UNKNOWN"
 
 def keyboard():
     return ReplyKeyboardMarkup(
@@ -1043,7 +1069,7 @@ async def check_all(update: Update):
 
     for item in rows:
         fb_id = item["fb_id"]
-        status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN"
+        status = check_facebook(fb_id)
         now = now_text()
 
         con = db()
@@ -1313,7 +1339,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.startswith("https://www.facebook.com/"):
             await update.message.reply_text(
                 "🔗 Đã nhận link Facebook dạng username/nickname.\n"
-                "ℹ️ Bot sẽ lưu link để mở Facebook. LIVE/DIE chỉ được kiểm tra khi có UID số."
+                "ℹ️ Bot sẽ kiểm tra khả dụng công khai của trang này. LIVE/DIE không phải trạng thái online/offline."
             )
 
         if get_account(user_id, text):
@@ -1353,7 +1379,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = text
 
         await update.message.reply_text("⏳ Đang kiểm tra UID...")
-        status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN"
+        status = check_facebook(fb_id)
         created = now_text()
 
         con = db()
@@ -1431,7 +1457,7 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
         user_id = row["telegram_user_id"]
         fb_id = row["fb_id"]
         old_status = row["status"]
-        new_status = check_facebook(fb_id) if str(fb_id).isdigit() else "UNKNOWN" if str(fb_id).isdigit() else "UNKNOWN"
+        new_status = check_facebook(fb_id)
         now = now_text()
         key = (user_id, fb_id)
 
@@ -2343,7 +2369,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V15 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V16 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
