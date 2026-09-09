@@ -118,6 +118,17 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expiry_reminders(
+            telegram_user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            expiry_key TEXT NOT NULL,
+            reminder_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (telegram_user_id, plan, expiry_key, reminder_key)
+        )
+    """)
+
     con.commit()
     con.close()
 
@@ -689,19 +700,165 @@ async def require_active(update: Update):
     return None
 
 
+
+def reminder_already_sent(user_id, plan, expiry_key, reminder_key):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT 1 FROM expiry_reminders
+        WHERE telegram_user_id=? AND plan=? AND expiry_key=? AND reminder_key=?
+        LIMIT 1
+    """, (user_id, plan, expiry_key, reminder_key))
+    found = cur.fetchone() is not None
+    con.close()
+    return found
+
+
+def mark_reminder_sent(user_id, plan, expiry_key, reminder_key):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO expiry_reminders(
+            telegram_user_id, plan, expiry_key, reminder_key, sent_at
+        )
+        VALUES(?,?,?,?,?)
+    """, (user_id, plan, expiry_key, reminder_key, now_text()))
+    con.commit()
+    con.close()
+
+
+async def expiry_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Nhắc hạn 7 ngày, 3 ngày, 1 ngày và khi hết hạn; mỗi mốc chỉ gửi 1 lần."""
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT telegram_user_id, chat_id, plan, expires_at, is_active
+        FROM users
+        WHERE plan IN ('TRIAL', 'VIP')
+    """)
+    users = cur.fetchall()
+    con.close()
+
+    current = now_dt()
+
+    for row in users:
+        user_id = row["telegram_user_id"]
+        chat_id = row["chat_id"]
+        plan = row["plan"]
+        expires = parse_dt(row["expires_at"])
+
+        if not expires:
+            continue
+
+        expiry_key = row["expires_at"]
+        seconds_left = int((expires - current).total_seconds())
+
+        if seconds_left <= 0:
+            reminder_key = "expired"
+            if reminder_already_sent(user_id, plan, expiry_key, reminder_key):
+                continue
+
+            if plan == "TRIAL":
+                text = (
+                    "⛔ <b>GÓI DÙNG THỬ ĐÃ HẾT HẠN</b>\n\n"
+                    "🎁 Thời gian dùng thử của bạn đã kết thúc.\n"
+                    f"💎 Nâng cấp VIP chỉ <b>{VIP_PRICE:,}đ/tháng</b>, "
+                    f"được theo dõi tối đa <b>{VIP_UID_LIMIT} UID</b>.\n"
+                    "❤️ Việc nâng cấp cũng giúp ủng hộ chi phí duy trì hệ thống.\n\n"
+                    "👉 Bấm <b>💳 Gia hạn</b> để xem thông tin nâng cấp."
+                ).replace(",", ".")
+            else:
+                text = (
+                    "⛔ <b>GÓI VIP ĐÃ HẾT HẠN</b>\n\n"
+                    "💎 Gói VIP của bạn đã hết hạn.\n"
+                    "🔔 Việc theo dõi UID sẽ tạm dừng cho đến khi tài khoản được gia hạn.\n"
+                    "Xin vui lòng gia hạn để không ảnh hưởng đến công việc.\n\n"
+                    "👉 Bấm <b>💳 Gia hạn</b> để xem thông tin gia hạn."
+                )
+
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                mark_reminder_sent(user_id, plan, expiry_key, reminder_key)
+            except Exception as e:
+                print("[EXPIRY_REMINDER_SEND_ERROR]", user_id, reminder_key, type(e).__name__, flush=True)
+            continue
+
+        days_left = max(1, (seconds_left + 86399) // 86400)
+        if days_left not in (7, 3, 1):
+            continue
+
+        reminder_key = f"{days_left}d"
+        if reminder_already_sent(user_id, plan, expiry_key, reminder_key):
+            continue
+
+        if plan == "TRIAL":
+            text = (
+                "⏰ <b>THÔNG BÁO GÓI DÙNG THỬ</b>\n\n"
+                f"🎁 Bạn còn <b>{days_left} ngày dùng thử</b> LAPTINH FB MONITOR PRO.\n"
+                f"💎 Hãy nâng cấp gói VIP chỉ <b>{VIP_PRICE:,}đ/tháng</b>, "
+                f"được dùng tối đa <b>{VIP_UID_LIMIT} UID</b> "
+                "để tiếp tục sử dụng và ủng hộ chi phí duy trì hệ thống.\n\n"
+                "👉 Bấm <b>💳 Gia hạn</b> để xem thông tin nâng cấp."
+            ).replace(",", ".")
+        else:
+            text = (
+                "⚠️ <b>GÓI VIP SẮP HẾT HẠN</b>\n\n"
+                f"💎 Gói VIP của bạn còn <b>{days_left} ngày nữa là hết hạn</b>.\n"
+                f"📅 Ngày hết hạn: <b>{html.escape(str(row['expires_at']))}</b>\n"
+                "🔔 Xin vui lòng gia hạn để không ảnh hưởng đến công việc.\n\n"
+                "👉 Bấm <b>💳 Gia hạn</b> để xem thông tin gia hạn."
+            )
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            mark_reminder_sent(user_id, plan, expiry_key, reminder_key)
+        except Exception as e:
+            print("[EXPIRY_REMINDER_SEND_ERROR]", user_id, reminder_key, type(e).__name__, flush=True)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = ensure_user(update)
-    text = (
-        "🤖 LAPTINH FB MONITOR PRO\n\n"
-        "Theo dõi tín hiệu khả dụng công khai của Facebook UID.\n"
-        "LIVE/DIE ở đây không phải trạng thái online/offline riêng tư.\n\n"
-        f"🎁 Gói: {row['plan']}\n"
-        f"📦 Giới hạn: {row['uid_limit']} UID\n"
-        f"📅 Hết hạn: {'Không giới hạn' if row['plan'] == 'ADMIN' else row['expires_at']}\n"
-        f"⏳ Còn lại: {remaining_text(row)}\n\n"
-        "Chọn chức năng:"
+    plan = row["plan"]
+
+    if plan == "ADMIN":
+        text = (
+            "👑 <b>LAPTINH FB MONITOR PRO - ADMIN</b>\n\n"
+            "✅ Tài khoản quản trị viên đang hoạt động.\n"
+            f"📦 Giới hạn hiện tại: <b>{row['uid_limit']} UID</b>\n"
+            "📅 Thời hạn: <b>Không giới hạn</b>\n\n"
+            "👇 Chọn chức năng bên dưới để bắt đầu."
+        )
+    elif plan == "VIP":
+        text = (
+            "💎 <b>CHÀO MỪNG THÀNH VIÊN VIP</b>\n\n"
+            "✅ Tài khoản của bạn đang sử dụng <b>gói VIP</b>.\n"
+            f"📦 Theo dõi tối đa: <b>{row['uid_limit']} UID</b>\n"
+            f"📅 Hết hạn: <b>{html.escape(str(row['expires_at']))}</b>\n"
+            f"⏳ Còn lại: <b>{html.escape(remaining_text(row))}</b>\n\n"
+            "❤️ Cảm ơn bạn đã sử dụng <b>LAPTINH FB MONITOR PRO</b>.\n"
+            "👇 Chọn chức năng bên dưới để bắt đầu."
+        )
+    else:
+        text = (
+            "👋 <b>Chào mừng bạn đến với LAPTINH FB MONITOR PRO</b>\n\n"
+            f"🎁 Bạn được dùng thử: <b>{TRIAL_DAYS} ngày – tối đa {TRIAL_UID_LIMIT} UID</b>.\n"
+            f"💎 Nâng cấp chỉ với giá <b>{VIP_PRICE:,}đ/tháng</b>, "
+            f"được dùng tối đa <b>{VIP_UID_LIMIT} UID</b>.\n\n"
+            f"📅 Hết hạn dùng thử: <b>{html.escape(str(row['expires_at']))}</b>\n"
+            f"⏳ Còn lại: <b>{html.escape(remaining_text(row))}</b>\n\n"
+            "🚀 <b>BẮT ĐẦU SỬ DỤNG</b>\n"
+            "1️⃣ Bấm <b>➕ Thêm UID</b>\n"
+            "2️⃣ Gửi UID hoặc link Facebook có UID số\n"
+            "3️⃣ Nhập tên, ghi chú và giá nếu cần\n"
+            "4️⃣ Bot sẽ tự động theo dõi LIVE/DIE\n\n"
+            "💡 Dùng /help để xem thêm hướng dẫn."
+        ).replace(",", ".")
+
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard()
     )
-    await update.message.reply_text(text, reply_markup=keyboard())
 
 
 async def account_info(update: Update):
@@ -1469,7 +1626,7 @@ async def extend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kích hoạt/gia hạn gói VIP: 20.000đ / 30 ngày / 1000 UID."""
+    """Kích hoạt/gia hạn gói VIP theo cấu hình hiện tại."""
     if not is_admin(update):
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
@@ -1602,8 +1759,14 @@ def main():
         first=10
     )
 
+    app.job_queue.run_repeating(
+        expiry_reminder_job,
+        interval=3600,
+        first=20
+    )
 
-    print(f"Laptinh FB Monitor PRO V12 đang hoạt động | DB={DB_FILE}", flush=True)
+
+    print(f"Laptinh FB Monitor PRO V13 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
