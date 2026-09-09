@@ -3,6 +3,7 @@ import sqlite3
 import requests
 import re
 import html
+import time
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 from threading import Thread
@@ -17,12 +18,14 @@ from telegram.ext import (
 TOKEN = os.environ.get("BOT_TOKEN")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "facebook_pro.db")
+AVATAR_CACHE_DIR = os.path.join(BASE_DIR, "avatar_cache")
+AVATAR_CACHE_TTL = 6 * 60 * 60  # 6 giờ
 CHECK_SECONDS = 30
-TRIAL_DAYS = 30
-TRIAL_UID_LIMIT = 100
+TRIAL_DAYS = 15
+TRIAL_UID_LIMIT = 5
 VIP_PRICE = 30000
 VIP_DAYS = 30
-VIP_UID_LIMIT = 1000
+VIP_UID_LIMIT = 50
 VN_TZ = timezone(timedelta(hours=7))
 
 # ADMIN_ID = Telegram numeric user ID của chủ bot.
@@ -71,6 +74,7 @@ def db():
 
 
 def init_db():
+    os.makedirs(AVATAR_CACHE_DIR, exist_ok=True)
     con = db()
     cur = con.cursor()
 
@@ -440,22 +444,179 @@ def get_live_avatar_url(fb_id):
     return None
 
 
+
+def _avatar_cache_candidates(fb_id):
+    safe_uid = re.sub(r"[^0-9A-Za-z_-]", "_", str(fb_id))
+    return (
+        os.path.join(AVATAR_CACHE_DIR, f"{safe_uid}.jpg"),
+        os.path.join(AVATAR_CACHE_DIR, f"{safe_uid}.png"),
+        os.path.join(AVATAR_CACHE_DIR, f"{safe_uid}.webp"),
+    )
+
+
+def _fresh_cached_avatar(fb_id):
+    now_ts = time.time()
+    for path in _avatar_cache_candidates(fb_id):
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) >= 2500:
+                age = now_ts - os.path.getmtime(path)
+                if age <= AVATAR_CACHE_TTL:
+                    return path
+        except OSError:
+            pass
+    return None
+
+
+def _stale_cached_avatar(fb_id):
+    newest = None
+    newest_mtime = -1
+    for path in _avatar_cache_candidates(fb_id):
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) >= 2500:
+                mtime = os.path.getmtime(path)
+                if mtime > newest_mtime:
+                    newest = path
+                    newest_mtime = mtime
+        except OSError:
+            pass
+    return newest
+
+
+def _cache_extension(content_type, final_url=""):
+    ctype = (content_type or "").lower()
+    low_url = (final_url or "").lower()
+
+    if "png" in ctype or ".png" in low_url:
+        return ".png"
+    if "webp" in ctype or ".webp" in low_url:
+        return ".webp"
+    return ".jpg"
+
+
+def get_cached_live_avatar(fb_id):
+    """
+    V11:
+    - Ưu tiên avatar đã cache trong 6 giờ.
+    - Nếu cache hết hạn, lấy lại avatar công khai bằng logic hiện có.
+    - Tải ảnh về VPS rồi gửi file trực tiếp cho Telegram.
+    - Nếu Facebook tạm lỗi nhưng còn cache cũ, dùng cache cũ làm fallback.
+    - Không dùng cookie, access token hoặc phiên đăng nhập Facebook.
+    """
+    cached = _fresh_cached_avatar(fb_id)
+    if cached:
+        print("[AVATAR_CACHE_HIT]", f"uid={fb_id}", cached, flush=True)
+        return cached
+
+    avatar_url = get_live_avatar_url(fb_id)
+    if not avatar_url:
+        stale = _stale_cached_avatar(fb_id)
+        if stale:
+            print("[AVATAR_CACHE_STALE_FALLBACK]", f"uid={fb_id}", stale, flush=True)
+        return stale
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    }
+
+    try:
+        r = requests.get(
+            avatar_url,
+            headers=headers,
+            timeout=20,
+            allow_redirects=True
+        )
+
+        ctype = (r.headers.get("content-type") or "").lower()
+        data = r.content or b""
+
+        if r.status_code != 200:
+            raise requests.RequestException(f"HTTP {r.status_code}")
+
+        if not ctype.startswith("image/"):
+            raise requests.RequestException(f"Not image: {ctype}")
+
+        if len(data) < 2500:
+            raise requests.RequestException(f"Image too small: {len(data)} bytes")
+
+        ext = _cache_extension(ctype, r.url)
+        safe_uid = re.sub(r"[^0-9A-Za-z_-]", "_", str(fb_id))
+        target = os.path.join(AVATAR_CACHE_DIR, f"{safe_uid}{ext}")
+        temp = target + ".tmp"
+
+        with open(temp, "wb") as f:
+            f.write(data)
+
+        os.replace(temp, target)
+
+        # Xóa các định dạng cache cũ của cùng UID để tránh nhầm file.
+        for old in _avatar_cache_candidates(fb_id):
+            if old != target:
+                try:
+                    if os.path.isfile(old):
+                        os.remove(old)
+                except OSError:
+                    pass
+
+        print(
+            "[AVATAR_CACHE_SAVED]",
+            f"uid={fb_id}",
+            f"bytes={len(data)}",
+            f"path={target}",
+            flush=True
+        )
+        return target
+
+    except (requests.RequestException, OSError) as e:
+        print(
+            "[AVATAR_CACHE_ERROR]",
+            f"uid={fb_id}",
+            type(e).__name__,
+            str(e)[:180],
+            flush=True
+        )
+        stale = _stale_cached_avatar(fb_id)
+        if stale:
+            print("[AVATAR_CACHE_STALE_FALLBACK]", f"uid={fb_id}", stale, flush=True)
+        return stale
+
+
+def clear_avatar_cache(fb_id):
+    for path in _avatar_cache_candidates(fb_id):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 async def send_account_ticket(message, row):
-    """LIVE: ưu tiên gửi avatar + ticket. DIE/UNKNOWN: gửi ticket chữ như cũ."""
+    """LIVE: ưu tiên gửi file avatar cache + ticket. DIE/UNKNOWN: gửi ticket chữ."""
     ticket = format_ticket(row)
 
     if row["status"] == "AVAILABLE":
-        avatar_url = get_live_avatar_url(row["fb_id"])
-        if avatar_url:
+        avatar_path = get_cached_live_avatar(row["fb_id"])
+        if avatar_path:
             try:
-                await message.reply_photo(
-                    photo=avatar_url,
-                    caption=ticket,
-                    reply_markup=keyboard()
-                )
+                with open(avatar_path, "rb") as photo_file:
+                    await message.reply_photo(
+                        photo=photo_file,
+                        caption=ticket,
+                        reply_markup=keyboard()
+                    )
                 return
             except Exception as e:
-                print("[AVATAR_SEND_ERROR]", row["fb_id"], type(e).__name__, flush=True)
+                print(
+                    "[AVATAR_SEND_ERROR]",
+                    row["fb_id"],
+                    type(e).__name__,
+                    str(e)[:180],
+                    flush=True
+                )
 
     await message.reply_text(ticket, reply_markup=keyboard())
 
@@ -1048,6 +1209,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.close()
 
         pending_changes.pop((user_id, text), None)
+        clear_avatar_cache(text)
         context.user_data.clear()
         await update.message.reply_text(
             "✅ Đã xóa UID." if deleted else "⚠️ Không tìm thấy UID này.",
@@ -1177,15 +1339,23 @@ async def auto_monitor(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             if new_status == "AVAILABLE":
-                avatar_url = get_live_avatar_url(fb_id)
-                if avatar_url:
+                avatar_path = get_cached_live_avatar(fb_id)
+                if avatar_path:
                     try:
-                        await context.bot.send_photo(
-                            chat_id=row["chat_id"],
-                            photo=avatar_url,
-                            caption=message
+                        with open(avatar_path, "rb") as photo_file:
+                            await context.bot.send_photo(
+                                chat_id=row["chat_id"],
+                                photo=photo_file,
+                                caption=message
+                            )
+                    except Exception as e:
+                        print(
+                            "[AVATAR_NOTIFY_ERROR]",
+                            fb_id,
+                            type(e).__name__,
+                            str(e)[:180],
+                            flush=True
                         )
-                    except Exception:
                         await context.bot.send_message(chat_id=row["chat_id"], text=message)
                 else:
                     await context.bot.send_message(chat_id=row["chat_id"], text=message)
@@ -1580,7 +1750,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V10 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V11 đang hoạt động | DB={DB_FILE} | AVATAR_CACHE={AVATAR_CACHE_DIR}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
