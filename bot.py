@@ -552,7 +552,7 @@ def check_facebook(fb_id):
       1) thử lấy UID từ dữ liệu công khai;
       2) nếu có UID thì dùng checker UID;
       3) nếu không có UID thì kiểm tra URL công khai;
-      4) chỉ trả UNKNOWN khi tín hiệu không đủ rõ.
+      4) chỉ UNKNOWN khi thật sự bị chuyển hướng sang login/checkpoint/challenge.
     """
     value = str(fb_id or "").strip()
 
@@ -573,7 +573,7 @@ def check_facebook(fb_id):
             return "DIE"
 
         if value.lower().startswith(("https://facebook.com/", "https://www.facebook.com/")):
-            # Ưu tiên chuyển username -> UID nếu HTML công khai có ID.
+            # Ưu tiên tìm UID công khai.
             resolved_uid = resolve_public_facebook_uid(value)
             if resolved_uid:
                 return check_facebook(resolved_uid)
@@ -592,7 +592,8 @@ def check_facebook(fb_id):
                 }
             )
 
-            final_url = str(r.url or "").lower()
+            final_url = str(r.url or "")
+            final_lower = final_url.lower()
             body = (r.text or "").lower()
 
             if r.status_code == 404:
@@ -607,18 +608,22 @@ def check_facebook(fb_id):
             if any(x in body for x in unavailable_markers):
                 return "DIE"
 
-            # Login/checkpoint/challenge không đủ để kết luận profile chết.
-            uncertain_markers = (
+            # QUAN TRỌNG:
+            # Không xét "login_form" hay chữ "login" trong HTML vì trang Facebook
+            # công khai bình thường cũng có thể chứa các thành phần đăng nhập.
+            # Chỉ UNKNOWN khi URL cuối thực sự bị đưa sang luồng login/checkpoint.
+            redirect_uncertain = (
                 "/login",
                 "/checkpoint",
-                "login_form",
-                "security check",
+                "/recover",
+                "/two_step_verification",
             )
-            if any(x in final_url or x in body for x in uncertain_markers):
+            if any(x in final_lower for x in redirect_uncertain):
                 return "UNKNOWN"
 
-            # Trang Facebook công khai trả thành công và không có tín hiệu lỗi.
-            if r.status_code < 400 and "facebook.com" in final_url:
+            # Nếu vẫn ở đúng miền Facebook, HTTP thành công và không có tín hiệu DIE,
+            # coi profile/link công khai là LIVE theo nghĩa "còn truy cập được".
+            if r.status_code < 400 and "facebook.com" in final_lower:
                 return "LIVE"
 
             return "UNKNOWN"
@@ -2446,7 +2451,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V17 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V18 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
