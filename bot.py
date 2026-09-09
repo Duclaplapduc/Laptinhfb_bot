@@ -483,12 +483,76 @@ async def send_account_ticket(message, row):
     await message.reply_text(ticket, parse_mode="HTML", reply_markup=keyboard())
 
 
+
+def resolve_public_facebook_uid(profile_url):
+    """
+    Thử lấy UID số chỉ từ tín hiệu công khai trong HTML/redirect của profile.
+    Không đăng nhập, không cookie, không vượt challenge.
+    Trả UID số hoặc None.
+    """
+    value = str(profile_url or "").strip()
+    if not value.lower().startswith(("https://facebook.com/", "https://www.facebook.com/")):
+        return None
+
+    try:
+        r = requests.get(
+            value,
+            timeout=10,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/139.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9"
+            }
+        )
+
+        final_url = str(r.url or "")
+        body = r.text or ""
+
+        # Redirect/profile.php?id=UID
+        try:
+            parsed = urlparse(final_url)
+            q = parse_qs(parsed.query)
+            ids = q.get("id", [])
+            if ids and ids[0].isdigit():
+                return ids[0]
+        except Exception:
+            pass
+
+        # Các trường ID công khai thường xuất hiện trong metadata/HTML.
+        patterns = (
+            r'"userID"\s*:\s*"(\d{5,})"',
+            r'"profile_id"\s*:\s*"(\d{5,})"',
+            r'"profileID"\s*:\s*"(\d{5,})"',
+            r'"entity_id"\s*:\s*"(\d{5,})"',
+            r'profile\.php\?id=(\d{5,})',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, body, flags=re.I)
+            if m:
+                return m.group(1)
+
+    except requests.RequestException:
+        return None
+
+    return None
+
+
 def check_facebook(fb_id):
     """
-    Heuristic công khai:
-    - UID số: dùng graph.facebook.com/{uid}/picture?type=normal như trước.
-    - Link username/nickname: kiểm tra trực tiếp URL profile công khai.
-    LIVE/DIE ở đây chỉ là khả dụng công khai, không phải online/offline.
+    Kiểm tra khả dụng công khai, không phải trạng thái online/offline.
+
+    UID số:
+      Graph picture heuristic như bản trước.
+
+    Link username:
+      1) thử lấy UID từ dữ liệu công khai;
+      2) nếu có UID thì dùng checker UID;
+      3) nếu không có UID thì kiểm tra URL công khai;
+      4) chỉ trả UNKNOWN khi tín hiệu không đủ rõ.
     """
     value = str(fb_id or "").strip()
 
@@ -508,8 +572,12 @@ def check_facebook(fb_id):
                 return "DIE"
             return "DIE"
 
-        # Username/nickname URL: chỉ kiểm tra trang công khai, không đăng nhập/cookie.
         if value.lower().startswith(("https://facebook.com/", "https://www.facebook.com/")):
+            # Ưu tiên chuyển username -> UID nếu HTML công khai có ID.
+            resolved_uid = resolve_public_facebook_uid(value)
+            if resolved_uid:
+                return check_facebook(resolved_uid)
+
             r = requests.get(
                 value,
                 timeout=10,
@@ -519,12 +587,11 @@ def check_facebook(fb_id):
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/139.0.0.0 Safari/537.36"
-                    )
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9"
                 }
             )
 
-            # Facebook có thể trả trang login/challenge dù profile tồn tại,
-            # nên chỉ dùng tín hiệu công khai thận trọng.
             final_url = str(r.url or "").lower()
             body = (r.text or "").lower()
 
@@ -540,8 +607,17 @@ def check_facebook(fb_id):
             if any(x in body for x in unavailable_markers):
                 return "DIE"
 
-            # Nếu truy cập được trang/profile mà không rơi vào lỗi rõ ràng,
-            # coi là LIVE theo nghĩa "profile công khai khả dụng".
+            # Login/checkpoint/challenge không đủ để kết luận profile chết.
+            uncertain_markers = (
+                "/login",
+                "/checkpoint",
+                "login_form",
+                "security check",
+            )
+            if any(x in final_url or x in body for x in uncertain_markers):
+                return "UNKNOWN"
+
+            # Trang Facebook công khai trả thành công và không có tín hiệu lỗi.
             if r.status_code < 400 and "facebook.com" in final_url:
                 return "LIVE"
 
@@ -551,6 +627,7 @@ def check_facebook(fb_id):
 
     except requests.RequestException:
         return "UNKNOWN"
+
 
 def keyboard():
     return ReplyKeyboardMarkup(
@@ -1339,7 +1416,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.startswith("https://www.facebook.com/"):
             await update.message.reply_text(
                 "🔗 Đã nhận link Facebook dạng username/nickname.\n"
-                "ℹ️ Bot sẽ kiểm tra khả dụng công khai của trang này. LIVE/DIE không phải trạng thái online/offline."
+                "ℹ️ Bot sẽ thử xác định UID từ dữ liệu công khai trước, sau đó kiểm tra khả dụng của trang. LIVE/DIE không phải trạng thái online/offline."
             )
 
         if get_account(user_id, text):
@@ -2369,7 +2446,7 @@ def main():
     )
 
 
-    print(f"Laptinh FB Monitor PRO V16 đang hoạt động | DB={DB_FILE}", flush=True)
+    print(f"Laptinh FB Monitor PRO V17 đang hoạt động | DB={DB_FILE}", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 
